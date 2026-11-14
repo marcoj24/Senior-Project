@@ -300,6 +300,39 @@ When on:
   the amount at risk;
 - the daily halt and kill switch cover spot and futures together.
 
+**Owner's risk tolerance (stated 2026-11-14):** the owner accepts aggressive
+leveraged trading. The caps above were the builder's conservative defaults and
+are superseded by the profile below, to be confirmed by the owner when phase 2
+is planned. All of it is configuration.
+
+| Setting | Conservative (original) | Aggressive (proposed) |
+|---|---|---|
+| Track-record requirement before futures | 50 trades, profit factor 1.3 | none; a warning is shown if the record is thinner |
+| Total effective leverage | 2× | 5× |
+| Per-position leverage | 3× | 5× |
+| Risk per trade | 3% of equity | 5% of equity |
+| Total open risk | 8% | 15% |
+| Drawdown kill switch | 25% from peak | 40% from peak |
+| Minimum equity for futures | $500 | whatever lets one contract fit the leverage cap |
+
+What does not loosen, because these are what stop a single bad trade ending
+the account rather than limits on aggression:
+
+- the stop sits no further than halfway to the liquidation price (at 5× that
+  means stops of 10% or tighter);
+- every position has a protective stop resting on the exchange;
+- the daily loss halt and the kill switch exist and only the owner resets the
+  kill switch;
+- no averaging down, and Claude can still only approve, shrink or veto.
+
+Costs of the aggressive profile the owner should expect: at 5% risk per trade
+with a strategy that wins about 4 trades in 10, five losses in a row is
+ordinary, which is a 23% drawdown; the 40% kill switch is sized for that.
+Leverage does not improve a strategy's edge. It lets the same edge compound
+faster and lets a losing streak, a gap through a stop, or an exchange outage
+do proportionally more damage. A gap larger than the liquidation distance
+loses the whole margin for that position regardless of the stop.
+
 Phase 2 gets its own plan later, once the owner's jurisdiction and futures
 venue (US dated contracts or international perpetuals) are known. Phase 1 only
 keeps sizing and limits free of spot-only assumptions (a position has a side
