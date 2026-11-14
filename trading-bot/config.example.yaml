@@ -1,0 +1,42 @@
+mode: paper                 # paper | live (live also needs --i-understand-live)
+cycle_minutes: 15           # minutes between decision cycles
+fill_poll_seconds: 5        # seconds between order fill polls
+risk_per_trade: 0.03        # fraction of equity risked per trade
+max_open_risk: 0.08         # total open risk cap, fraction of equity
+stop_atr_mult: 2.0          # stop distance = this x ATR(14)
+stop_min: 0.05              # minimum stop distance, fraction of entry
+stop_max: 0.15              # maximum stop distance, fraction of entry
+max_position_small: 0.50    # max position fraction of equity under small_equity
+max_position: 0.35          # max position fraction of equity otherwise
+small_equity: 100           # USD equity below which the small cap applies
+max_exposure: 1.0           # max total exposure, fraction of equity
+daily_loss_halt: 0.06       # halt new entries after this daily loss fraction
+kill_drawdown: 0.25         # kill switch at this drawdown from equity peak
+streak_losses: 3            # consecutive losses that trigger the streak brake
+streak_factor: 0.5          # risk multiplier while the streak brake is on
+post_reset_trades: 10       # trades at reduced risk after a reset
+post_reset_factor: 0.5      # risk multiplier after a reset
+min_size_mult: 0.25         # floor for the combined size multiplier
+cost_max_frac_of_stop: 0.20 # losing-trade cost must be <= this fraction of stop distance
+min_net_rr: 1.5             # minimum reward-to-risk after costs
+target_r: 2.0               # first target in R multiples
+slippage: 0.001             # slippage allowance, fraction of price
+stop_limit_offset: 0.05     # stop-limit offset below trigger, fraction
+trail_min_improve_atr: 0.5  # trail stop only when improvement >= this many ATR
+entry_ttl_hours: 24         # entry order lifetime in hours
+setup_valid_candles: 12     # setup validity in four-hour candles
+min_volume_24h_usd: 5000000 # minimum 24h volume for the universe
+max_spread: 0.002           # maximum bid/ask spread, fraction
+min_history_days: 250       # minimum candle history required
+always_include: [BTC-USD, ETH-USD, SOL-USD]  # products always in the universe
+tiers: [[100, 2], [1000, 3], [10000, 5], [.inf, 6]]  # [equity limit, max positions]
+review_enabled: true        # enable the AI review (can only veto)
+model_small: claude-haiku-5-5   # Claude model under model_switch_equity
+model_large: claude-sonnet-5-5  # Claude model at or above model_switch_equity
+model_switch_equity: 1000   # USD equity at which the larger model is used
+max_calls_per_day: 6        # max Claude calls per day
+monthly_budget_usd: 3.0     # max Claude spend per month
+scorecard_min: 40           # reviewed candidates before the scorecard verdict
+alert_url: null             # webhook for alerts (optional)
+heartbeat_url: null         # webhook pinged each cycle (optional)
+db_path: bot.db             # SQLite database path
