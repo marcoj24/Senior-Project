@@ -1361,7 +1361,7 @@ FAIL_BEFORE = ["place_stop", "place_bracket", "place_ioc_sell", "cancel", "get_o
                "balances", "bid_ask", "get_order_by_client_id", "products"]
 FAIL_AFTER = ["place_stop", "place_bracket", "place_ioc_sell"]  # the order is created, the reply is lost
 STATUS_READS = {"open_orders", "get_order", "products"}  # without these the bot cannot see the venue at all
-SEEDS = [21, 115, 1114]
+SEEDS = [10, 15, 1114]  # 10 and 15 fail if coverage ignores gaps beside an IOC, or sizes keep float noise
 
 
 def truth(w, pid="SOL-USD"):

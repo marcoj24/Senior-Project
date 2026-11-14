@@ -1166,8 +1166,9 @@ class Engine:
                 if not any(lg.kind == "stop" for lg in pos.legs):
                     size = round_down(self._room(pos), p.base_increment)
                     if size < p.min_base_size:
-                        self._dust(pos, "stop remainder")
-                        return
+                        if self._is_dust(pos):
+                            self._dust(pos, "stop remainder")
+                        return  # otherwise an exit in flight holds the rest
                     self._place_leg(pos, "stop", size, new_stop)  # raises unless confirmed live
                 self._log("stop_moved", pid, why=why, old_stop=old, new_stop=new_stop, size=pos.base_size)
                 return
