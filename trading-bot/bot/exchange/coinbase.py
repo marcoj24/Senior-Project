@@ -225,7 +225,9 @@ class CoinbaseExchange:
         elif p.get("volume_24h") not in (None, "") and p.get("price") not in (None, ""):
             volume = _num(p, "volume_24h", what) * _num(p, "price", what)
         else:
-            raise ExchangeError(f"{what}: response has no 24h volume")
+            # Coinbase lists some products (e.g. DAI-USD) with no volume at all.
+            # Zero volume fails the liquidity filter, so the product is never traded.
+            volume = 0.0
         return Product(pid, str(_req(p, "base_currency_id", what)), str(_req(p, "quote_currency_id", what)),
                        _num(p, "base_increment", what), _num(p, "quote_increment", what),
                        _num(p, "base_min_size", what), status, volume)
