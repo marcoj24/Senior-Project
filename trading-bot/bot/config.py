@@ -52,6 +52,7 @@ class Config:
     alert_url: str | None = None
     heartbeat_url: str | None = None
     db_path: str = "bot.db"
+    reports_dir: str = "reports"
 
 
 def load_config(path: str) -> Config:

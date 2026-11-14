@@ -45,7 +45,7 @@ class PaperExchange:
       limit sell: on a later candle it fills at max(stop_limit, candle.open) if
       candle.high >= stop_limit; taker fee. A triggered bracket stop cancels the target leg.
     - bracket target: fills at target if candle.high > target and the stop never triggered; maker fee.
-    - ioc sell: fills at max(limit, close) if close >= limit, else cancels; taker fee.
+    - ioc sell: fills at the bid, close * (1 - spread/2), if that is >= its limit, else cancels; taker fee.
     """
 
     def __init__(self, cash: float, fees: Fees, products: list[Product], supports_bracket: bool = True,
@@ -274,8 +274,9 @@ class PaperExchange:
             elif o.kind == "bracket" and c.high > o.target:
                 self._fill(o, o.remaining, o.target, c.ts, "target")
         elif o.kind == "ioc":
-            if c.close >= o.limit_price:
-                self._fill(o, o.remaining, max(o.limit_price, c.close), c.ts, "ioc")
+            bid = c.close * (1 - self._spread / 2)
+            if bid >= o.limit_price:
+                self._fill(o, o.remaining, bid, c.ts, "ioc")
             else:
                 o.status = "cancelled"
 

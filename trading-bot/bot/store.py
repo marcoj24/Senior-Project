@@ -137,3 +137,16 @@ class Store:
             "SELECT COUNT(*) FROM journal WHERE kind = 'api_cost' AND ts >= ?", (since_ts,)
         ).fetchone()
         return row[0]
+
+    def closed_shadows(self) -> list[dict]:
+        """Resolved shadows: the candidate's fields plus id, decision, multiplier, ts, r_multiple."""
+        rows = self._db.execute(
+            "SELECT id, candidate, decision, multiplier, ts, r_multiple FROM shadows "
+            "WHERE closed = 1 ORDER BY id"
+        )
+        out = []
+        for sid, cand, decision, mult, ts, r in rows:
+            d = json.loads(cand)
+            d.update(id=sid, decision=decision, multiplier=mult, ts=ts, r_multiple=r)
+            out.append(d)
+        return out

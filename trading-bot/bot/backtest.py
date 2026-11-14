@@ -162,7 +162,7 @@ class Replay:
 
     def __init__(self, history: dict[str, list[Candle]], cfg: Config, fees: Fees, start_equity: float = 25.0):
         self.history = history if isinstance(history, History) else History(history)
-        self.cfg = replace(cfg, review_enabled=False)
+        self.cfg = replace(cfg, review_enabled=False, reports_dir="")  # no report files from a replay
         self.fees, self.start_equity = fees, start_equity
         self.clock = _Clock()
         self._h1 = {pid: {c.ts: c for c in cs} for pid, cs in self.history.items() if cs}

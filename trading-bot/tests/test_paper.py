@@ -108,16 +108,16 @@ def test_bracket_target_fills_at_maker(px):
     assert px.balances()["SOL"] == 0.0
 
 
-def test_ioc_sell_fills_at_close_or_cancels(px):
+def test_ioc_sell_fills_at_bid_or_cancels(px):
     hold_tenth(px)
     a = px.place_ioc_sell("SOL-USD", 0.05, 95.0, "i1")
-    px.feed("SOL-USD", H, Candle(H, 96, 98, 94, 97, 1))  # fill at max(95, 97) = 97
+    px.feed("SOL-USD", H, Candle(H, 96, 98, 94, 97, 1))  # fills at the bid: 97 * (1 - 0.001/2) = 96.9515 >= 95
     assert px.get_order(a).status == "filled"
     f = px.fills(H)[0]
-    assert (f.price, f.reason) == (97.0, "ioc")
-    assert f.fee == pytest.approx(0.05 * 97 * 0.012)
+    assert f.price == pytest.approx(96.9515) and f.reason == "ioc"
+    assert f.fee == pytest.approx(0.05 * 96.9515 * 0.012)
     b = px.place_ioc_sell("SOL-USD", 0.05, 95.0, "i2")
-    px.feed("SOL-USD", H, Candle(2 * H, 96, 97, 93, 94, 1))  # close 94 < 95
+    px.feed("SOL-USD", H, Candle(2 * H, 96, 97, 93, 94, 1))  # bid 93.953 < 95
     assert px.get_order(b).status == "cancelled" and px.balances()["SOL"] == pytest.approx(0.05)
 
 

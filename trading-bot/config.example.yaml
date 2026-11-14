@@ -41,3 +41,4 @@ scorecard_min: 40           # reviewed candidates before the scorecard verdict
 alert_url: null             # webhook for alerts (optional)
 heartbeat_url: null         # webhook pinged each cycle (optional)
 db_path: bot.db             # SQLite database path
+reports_dir: reports      # directory for the daily report files

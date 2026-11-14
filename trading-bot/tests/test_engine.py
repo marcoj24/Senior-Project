@@ -1121,7 +1121,7 @@ def test_fills_that_never_arrive_close_the_trade_once_on_estimates(monkeypatch):
     w = World()
     pos, ioc = forced_ioc(w)
     w.ex.hold_fills = True
-    w.bar(89.0, low=87.0, high=91.0, open_=90.0)  # the IOC fills at 89.0; its fills never arrive
+    w.bar(89.0, low=87.0, high=91.0, open_=90.0)  # the IOC fills at the bid (89.0 less half the spread); its fills never arrive
     r = w.engine.run_cycle()
     assert r.exited == ["SOL-USD"] and w.position() is None  # flat by order status, at once
     for _ in range(w.cfg.fill_wait_cycles - 1):
@@ -1134,7 +1134,7 @@ def test_fills_that_never_arrive_close_the_trade_once_on_estimates(monkeypatch):
     d = closed["data"]
     assert d["estimated"] and d["exit_reason"] == "ioc"
     assert d["sold"] == pytest.approx(pos.base_size) and d["bought"] == pytest.approx(pos.base_size)
-    assert d["proceeds"] == pytest.approx(pos.base_size * 89.0)  # the order's own average fill price
+    assert d["proceeds"] == pytest.approx(pos.base_size * 89.0 * (1 - 0.0005))  # the IOC fills at the bid, 89 * (1 - spread/2)
     assert d["sell_fee"] == pytest.approx(d["proceeds"] * FEES.taker)  # no fill: fee at the venue's rate
     assert d["pnl_usd"] < 0 and calls == [d["pnl_usd"]]
     assert w.titles().count("trade closed on estimated prices") == 1
@@ -1532,3 +1532,34 @@ def test_instant_target_ioc_takes_half_and_moves_the_rest_to_break_even():
     assert after.half_taken and after.base_size == pytest.approx(pos.base_size - a)
     w.cycle()
     assert w.position().stop_price >= ENTRY and w.sells() == pytest.approx(after.base_size)
+
+
+@pytest.fixture(autouse=True)
+def _reports_in_tmp(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # the daily report is written under the working directory
+
+
+def test_first_cycle_of_a_day_writes_report_and_alerts_once():
+    w = World()
+    w.cycle()
+    report = Path("reports") / f"{DAY0}.txt"
+    assert "Daily report" in report.read_text()
+    assert w.titles().count(f"daily report {DAY0}") == 1
+    w.clock.t += 900
+    w.cycle()
+    assert w.titles().count(f"daily report {DAY0}") == 1
+    w.clock.t += D1
+    w.cycle()
+    assert len(w.titles()) and sum(t.startswith("daily report") for t in w.titles()) == 2
+
+
+def test_open_shadow_is_resolved_by_later_hourly_candles():
+    w = World(entry=("veto", 0.0))
+    w.cycle()
+    [shadow] = w.store.open_shadows()
+    t = shadow["ts"]
+    w.ex.feed("SOL-USD", 3600, Candle(t, 125, 126, 119.0, 120, 1))  # trades through the entry
+    w.ex.feed("SOL-USD", 3600, Candle(t + 3600, 120, 130, 101.0, 105, 1))  # then through the stop
+    w.cycle()
+    assert w.store.open_shadows() == []
+    assert w.store.closed_shadows()[0]["r_multiple"] == -1.0

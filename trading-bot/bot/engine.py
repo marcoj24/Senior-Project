@@ -15,6 +15,7 @@ Safety rules kept throughout:
 
 import json
 import math
+import os
 import traceback
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -29,6 +30,7 @@ from bot.indicators import atr
 from bot import orders as ledger
 from bot.models import Candidate, Leg, Position, Product
 from bot.orders import EPS as _EPS, add as _add, sub as _sub
+from bot.report import daily_summary, resolve_shadow
 from bot.regime import breadth, confirmed_regime, raw_regime
 from bot.reviewer import Reviewer
 from bot.risk import (RiskState, apply_transfer, check_limits, correlation_ok, max_positions,
@@ -39,6 +41,8 @@ from bot.universe import build_universe, prefilter
 
 BTC = "BTC-USD"
 H4_LIMIT = 200
+H1 = 3600
+SHADOW_CANDLES = 300  # hourly candles fetched to resolve a shadow
 FORCED_EXIT_PRICE = 0.98  # IOC limit as a fraction of bid
 TARGET_EXIT_PRICE = 0.995  # bot-managed target (venue without brackets): IOC limit as a fraction of bid
 FAILED_CYCLES_ALERT = 3
@@ -243,10 +247,34 @@ class Engine:
                 entries_ok = not res.errors
                 self._step(res, "limits", lambda r: self._limits_and_entries(r, entries_ok))
                 self._repair_coverage()  # a last pass: nothing a step left uncovered waits for the poll
+                self._step(res, "shadows", self._resolve_shadows)
+                self._step(res, "daily_report", self._daily_report)
         finally:
             res.exited = list(self._exited)
             self._guard(None, None, "record", lambda: self._record(res))
         return res
+
+    # ---------------------------------------------------------------- shadows and daily report
+
+    def _resolve_shadows(self, res: CycleResult) -> None:
+        for sh in self.store.open_shadows():
+            def one(sh=sh) -> None:
+                after = self.ex.candles(sh["product_id"], H1, SHADOW_CANDLES)
+                r = resolve_shadow(sh, after, self.cfg)
+                if r is not None:
+                    self.store.close_shadow(sh["id"], r)
+            self._guard(res, sh["product_id"], "shadow", one)
+
+    def _daily_report(self, res: CycleResult) -> None:
+        today = self._today()
+        if not self.cfg.reports_dir or self._meta("report_day", "") == today:
+            return
+        text = daily_summary(self.store, self.equity(), self.now(), self.cfg)
+        os.makedirs(self.cfg.reports_dir, exist_ok=True)
+        with open(os.path.join(self.cfg.reports_dir, f"{today}.txt"), "w") as f:
+            f.write(text + "\n")
+        self._set_meta("report_day", today)
+        self._alert(f"daily report {today}", text)
 
     # ---------------------------------------------------------------- cycle plumbing
 
