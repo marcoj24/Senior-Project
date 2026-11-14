@@ -54,7 +54,10 @@ the target.
   The bot reads its actual fee tier from the API; it never hard-codes fees.
 - Product minimum order sizes limit how many positions $25 can hold.
 - Claude API spend must stay small relative to the account: a few calls per
-  day, not one per loop.
+  day, not one per loop. Even so, at $25 a dollar or two a month of API cost
+  is several percent of the account. It is paid outside the trading account,
+  capped per month in configuration, recorded in the journal as an expense,
+  and subtracted in the reported "true P&L".
 - The bot needs an always-on host (owner's machine or a small server). It must
   recover cleanly from restarts and downtime.
 - Futures availability depends on the owner's jurisdiction and account
@@ -100,8 +103,11 @@ Each cycle:
 
 USD spot pairs on Coinbase filtered by liquidity: a minimum 24h dollar volume
 and a maximum bid/ask spread, refreshed daily. BTC, ETH and SOL are always
-included. Stablecoin pairs and wrapped duplicates are excluded. Expected size
-is 10–20 products. Thresholds are configuration.
+included. Stablecoin pairs and wrapped duplicates are excluded. Products with
+less than 250 days of history are excluded (the indicators need the history,
+and new listings are where pump-and-dumps happen). Products the exchange flags
+as trading-disabled, cancel-only or limit-only are skipped. Expected size is
+10–20 products. Thresholds are configuration.
 
 ### Signals (trend and momentum)
 
@@ -110,8 +116,13 @@ is 10–20 products. Thresholds are configuration.
   risk-on, neutral, risk-off. Risk-off means no new long entries.
 - **Trend**: 4-hour EMA 20 above EMA 50, daily close above the 200-day EMA.
 - **Entry trigger**: a 4-hour close above the 20-period high (Donchian
-  breakout) with volume above its 20-period average, or a pullback to the
-  4-hour EMA 20 that holds within an established trend.
+  breakout) with volume above its 20-period average marks a *setup*. The
+  *entry* is a resting limit order at the retest of the breakout level or the
+  4-hour EMA 20, whichever is nearer. The bot does not buy the breakout candle
+  itself: a post-only order there fills mainly on the breakouts that fail.
+  Setups that never pull back are missed on purpose.
+- Signals use closed candles only. The regime label needs two consecutive
+  daily closes to change, so it does not flip back and forth at the line.
 - **Relative strength**: rank by 7- and 30-day return versus BTC; prefer
   leaders.
 - **Volatility**: 14-period ATR sets stop distance and position size.
@@ -121,11 +132,18 @@ held-out period to avoid curve-fitting.
 
 ### Cost gate
 
-For each candidate the bot computes round-trip cost = entry fee + exit fee +
-half-spread on each side + a slippage allowance. A trade is allowed only if:
+For each candidate the bot computes two costs: the winning round trip (maker
+entry, maker exit, spread) and the losing round trip (maker entry, **taker**
+exit on the stop, spread, slippage allowance). A trade is allowed only if:
 
-- distance to target ≥ 3 × round-trip cost, and
-- reward-to-risk (target distance ÷ stop distance) ≥ 2.
+- the losing round-trip cost is at most 20% of the stop distance, and
+- reward-to-risk **after costs** — (target distance − winning cost) ÷
+  (stop distance + losing cost) — is at least 1.8.
+
+At the lowest fee tier this forces stops of roughly 8% or wider, which means
+fewer, longer trades. That is intended: with a 6% stop the strategy would need
+to win about 42% of the time just to break even, which trend-following rarely
+does. The gate loosens by itself as the fee tier improves.
 
 **Targets and exits (builder's call):** the first target is 2 × the stop
 distance (2R); the cost gate is measured against it. At the first target half
@@ -135,15 +153,33 @@ position is too small to split above the product minimum, the whole position
 trails instead once 2R is reached.
 
 Entries are post-only limit orders (maker fee). An unfilled entry is cancelled
-after a set time; the bot does not chase. Exits at target are limit orders;
-stops are stop-limit orders resting on the exchange.
+after a set time; the bot does not chase.
+
+**Order mechanics.** On spot, coins held by one resting sell order cannot back
+a second one, so a separate stop and target cannot both rest on the same
+coins. The bot uses Coinbase's bracket order (stop and target in one order),
+attached to the entry where the API allows, so protection exists the moment
+the entry fills. If bracket orders prove unavailable, the fallback is: the
+stop rests on the exchange, the target is managed by the bot, and while an
+entry order is open the bot polls for the fill every few seconds and places
+the stop immediately.
+
+A stop-limit can be jumped in a gap and left unfilled. The stop's limit price
+is set well below its trigger (default 5%), and if a cycle finds price below
+the stop with the position still open, the bot exits at once with an
+immediate-or-cancel order and raises an alert.
+
+Moving a trailing stop means cancel-and-replace. The bot does it only when the
+stop improves by at least half an ATR, verifies the new stop is live, retries,
+and alerts if the position is ever without one.
 
 ### Sizing and risk limits (code only)
 
 | Limit | Default |
 |---|---|
-| Risk per trade (loss if stopped) | 3% of equity |
-| Stop distance | 2 × ATR, bounded to 3–12% |
+| Risk per trade (loss if stopped, **including fees and slippage**, on the size after rounding to the product's increments) | 3% of equity |
+| Total open risk across all positions | 8% of equity |
+| Stop distance | 2 × ATR, bounded to 5–15% |
 | Max single position | 50% of equity under $100; 35% above |
 | Max total spot exposure | 100% of equity |
 | Daily loss halt | −6% on the day: no new entries until next UTC day |
@@ -152,6 +188,19 @@ stops are stop-limit orders resting on the exchange.
 | Correlation cap | at most 2 positions from the same highly correlated group |
 
 Orders below a product's minimum size are skipped, not rounded up.
+
+Details that close gaps:
+
+- "Equity" is marked to market. The daily halt compares it with equity at the
+  start of the UTC day.
+- Crypto assets fall together. When the regime is not risk-on, all altcoins
+  count as one correlated group.
+- Size reductions (Claude's daily multiplier, Claude's entry multiplier, the
+  streak brake) multiply together. If the result is under a quarter of the
+  base size or under the product minimum, the trade is skipped and logged, so
+  stacked reductions cannot quietly stop all trading unnoticed.
+- After the owner resets the kill switch, the equity peak restarts at current
+  equity and risk per trade is halved for the next 10 trades.
 
 ### Diversification by equity tier
 
@@ -196,8 +245,17 @@ Two call types:
 Replies are structured JSON validated against a schema. Claude can only
 approve, shrink or block. If the reply is invalid, or the API is unavailable,
 the entry is treated as vetoed. Exits, stops and limits never depend on
-Claude. Calls are capped per day in configuration. The model is configurable;
-the default is a mid-tier Claude model to keep cost to cents per day.
+Claude. Calls are capped per day and per month in configuration. The model is
+configurable; under $1,000 of equity the default is the cheapest Claude model.
+The daily review is skipped when the bot is flat and the regime is risk-off.
+
+**Proving the judgment layer earns its place.** Every candidate is journaled
+with Claude's decision, including vetoed ones, and the bot tracks what each
+vetoed or reduced trade would have done. A scorecard in the daily summary
+compares results with and without Claude's decisions. If after 40 reviewed
+candidates the vetoes have not improved results, the summary says so and
+recommends switching review off. Each decision records the prompt version, so
+prompt changes can be compared.
 
 News is not an input in this version (builder's call): it cannot be
 backtested and adds cost and an injection surface. Everything passed to Claude
@@ -212,8 +270,9 @@ all of these hold:
 - the Coinbase account has futures trading approved;
 - equity is at least $500 (configurable) and the contract's margin and minimum
   size fit within the risk limits;
-- the live spot record has at least 30 closed trades with positive expectancy
-  after fees.
+- the live spot record has at least 50 closed trades with a profit factor of
+  1.3 or better after fees and API cost. (Thirty trades is too few to tell
+  skill from luck; fifty is still thin, which is why leverage stays capped.)
 
 When on:
 
@@ -255,12 +314,18 @@ It is not a promise of profit.
 
 - **backtest** — replays historical candles through the same signal, cost and
   sizing code, with fees and slippage. Claude review is off by default (a
-  small sampled replay may be offered).
+  small sampled replay may be offered). To keep the backtest honest: the
+  universe is rebuilt as it was on each past date (no picking today's
+  survivors); a limit order counts as filled only when price trades through
+  it, not on a touch; parameters are few and tuned walk-forward; and results
+  are shown next to simply holding BTC over the same period.
 - **paper** — live prices, simulated fills, full Claude review. This is the
   default mode.
 - **live** — real orders. Requires `mode: live` in configuration **and** a
   command-line confirmation flag. Recommended only after at least two weeks of
-  paper trading.
+  paper trading. Two weeks yields a handful of trades, so paper trading proves
+  the machinery works, not that the strategy has an edge; evidence of edge
+  comes from the walk-forward backtest and, later, the live record.
 
 ### Secrets and safety
 
@@ -271,13 +336,66 @@ It is not a promise of profit.
 - Every order carries a client order ID so a retry cannot double-place.
 - All decisions (signals, cost numbers, Claude's reply, order results) are
   journaled so any trade can be explained afterwards.
+- A trade-only key can still lose money if stolen (an attacker can trade
+  against the account in a thin market). The key is scoped to the bot's
+  portfolio, restricted to the host's IP address where Coinbase allows it, and
+  the liquidity filter keeps the bot out of thin markets. The Claude API key
+  gets a monthly spending limit in the Anthropic console.
+- Dependencies are pinned to exact versions. Logs never contain keys.
+- A lock file stops two copies of the bot running against the same account.
+
+### Operations
+
+- **Alerts.** Kill switch, daily halt, a missing stop, a forced exit, repeated
+  API errors and live-mode start are pushed to the owner's phone or email
+  (channel chosen at build time), not just written to a file.
+- **Heartbeat.** The bot pings an external monitor each cycle; if pings stop,
+  the monitor alerts the owner. Stops resting on the exchange protect
+  positions while the bot is down.
+- **Restart.** State is rebuilt from the exchange if the local database is
+  lost. Partial fills and leftover dust balances are handled explicitly.
+- **Exchange outages.** Coinbase has gone down during sharp moves before. No
+  bot can trade through that; small position sizes are the only defence.
 
 ### Testing
 
 Unit tests for signals, cost gate, sizing and every limit; tests that feed
 hostile or malformed Claude replies and confirm no limit moves; an
 integration test of the full cycle against a fake exchange; a restart test
-with open positions.
+with open positions; a gap-through-stop test; a test that an entry fill is
+never left without a stop; a test that stacked size reductions skip rather
+than undersize; a two-instance lock test.
+
+## Red-team review (2026-11-14)
+
+The design was attacked for ways it loses money or fails. Corrections are
+folded into the sections above.
+
+| # | Weakness found | Severity | Correction |
+|---|---|---|---|
+| 1 | Fees made the original strategy need ~42% winners to break even | Critical | Cost gate now caps cost at 20% of stop distance and tests reward-to-risk after costs; wider stops, fewer trades |
+| 2 | Post-only orders on breakouts fill mostly on failed breakouts | Critical | Enter on the retest, not the breakout candle |
+| 3 | Stop and target cannot both rest on the same spot coins | Critical | Bracket orders, with a defined fallback |
+| 4 | Up to 15 minutes unprotected between entry fill and stop | High | Stop attached to entry, or fast fill polling |
+| 5 | Stop-limit can be jumped in a gap | High | Wide limit offset plus forced exit and alert |
+| 6 | Risk per trade ignored fees and slippage (real loss ~30% larger) | High | Risk now includes them |
+| 7 | Several positions stopping together could lose far more than 6% | High | 8% cap on total open risk; altcoins treated as one group outside risk-on |
+| 8 | Backtest could flatter the strategy (survivor coins, optimistic fills, over-tuning) | High | Point-in-time universe, trade-through fills, walk-forward, BTC benchmark |
+| 9 | No evidence Claude's vetoes help | High | Shadow tracking and a scorecard; recommend switching off if no benefit |
+| 10 | Claude API cost is several percent of a $25 account per month | High | Cheapest model, call caps, skip when idle, cost counted in true P&L |
+| 11 | Kill switch or missing stop could go unnoticed | High | Push alerts and an external heartbeat |
+| 12 | Stolen trade-only key can still drain via thin markets | Medium | Portfolio scope, IP restriction, liquidity filter, spend cap |
+| 13 | Two weeks of paper trading and 30 trades prove little | Medium | Paper proves machinery only; futures gate raised to 50 trades and profit factor 1.3 |
+| 14 | Stacked size reductions could silently stop all trading | Medium | Skip-and-log floor |
+| 15 | Regime label could whipsaw; new listings lack history | Medium | Two-close confirmation; 250-day history rule |
+| 16 | Two bot copies could double-trade; trailing-stop replacement leaves a window | Medium | Lock file; verified cancel-and-replace with alert |
+
+**Not fixable by design:** exchange outages during crashes; a long bear market
+in which a long-only spot bot correctly sits in cash for months; and the size
+of the goal. Compounding $25 alone, even at 100% a year, takes about 15 years
+to reach $750k. Regular deposits once the bot has a live record would do more
+for the target than any strategy change, and the equity accounting already
+supports them.
 
 ## Left to the builder
 
