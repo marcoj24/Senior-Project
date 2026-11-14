@@ -1428,8 +1428,8 @@ class Engine:
                   "proposed": proposed, "portfolio": {**self._portfolio(equity), **book},
                   "recent_trades": [r["data"] for r in self.store.journal_rows("trade_closed")[-30:]]}
         d = self.reviewer.review_entry(packet, equity, now)
-        if d.decision in ("veto", "reduce"):
-            self.store.add_shadow(cand, d.decision, d.multiplier, now)
+        if d.replied and d.decision in ("veto", "reduce"):  # budget, disabled and invalid-reply vetoes are not Claude's
+            self.store.add_shadow(cand, d.decision, d.multiplier, now, cc.win_cost, cc.loss_cost)
         if d.decision == "veto":
             self._remember(key, "vetoed", cand)
             return f"vetoed: {d.reason}"
@@ -1451,8 +1451,8 @@ class Engine:
         self._register(oid, "entry", pid, key, base, candidate=asdict(cand), limit=limit, ref_price=limit)
         self._remember(key, "placed", cand)
         self._log("entry_placed", pid, order_id=oid, client_order_id=key, base_size=base, limit=limit,
-                  decision=d.decision, review_multiplier=d.multiplier, final_multiplier=final_mult,
-                  risk_usd=final.risk_usd)
+                  decision=d.decision, replied=d.replied, review_multiplier=d.multiplier,
+                  final_multiplier=final_mult, risk_usd=final.risk_usd)
         res.entered.append(pid)
         return None
 

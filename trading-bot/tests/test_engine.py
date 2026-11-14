@@ -234,6 +234,7 @@ def test_veto_places_nothing_and_records_shadow():
     assert r.skipped["SOL-USD"].startswith("vetoed")
     [shadow] = w.store.open_shadows()
     assert shadow["decision"] == "veto" and shadow["product_id"] == "SOL-USD"
+    assert shadow["win_cost"] > 0 and shadow["loss_cost"] > shadow["win_cost"]  # costs travel with it
     w.cycle()  # the same setup is not sent for review again
     assert w.llm.calls.count("entry") == 1 and len(w.store.open_shadows()) == 1
 
@@ -1643,3 +1644,18 @@ def test_engine_tells_the_venue_about_recent_quantity_changes():
     w.cycle()
     w.cycle()
     assert hints and True in hints
+
+
+def test_unreplied_vetoes_make_no_shadow_and_replies_are_marked():
+    w = World()
+    w.llm.entry = ("maybe", 1.0)  # not a valid decision: stored as an "invalid reply" veto
+    r = w.cycle()
+    assert r.skipped["SOL-USD"].startswith("vetoed") and w.store.open_shadows() == []
+    w2 = World()
+    w2.cycle()
+    [placed] = w2.store.journal_rows("entry_placed")
+    assert placed["data"]["replied"] is True
+    w3 = World(cfg=Config(review_enabled=False))
+    w3.cycle()
+    [placed] = w3.store.journal_rows("entry_placed")
+    assert placed["data"]["replied"] is False

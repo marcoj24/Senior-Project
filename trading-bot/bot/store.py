@@ -106,10 +106,16 @@ class Store:
             for i, k, pid, d, ts in rows
         ]
 
-    def add_shadow(self, cand: Candidate, decision: str, multiplier: float, ts: int) -> int:
+    def add_shadow(self, cand: Candidate, decision: str, multiplier: float, ts: int,
+                   win_cost: float | None = None, loss_cost: float | None = None) -> int:
+        """win_cost and loss_cost (fractions of entry) are kept with the candidate so the shadow can be
+        scored after costs."""
+        data = asdict(cand)
+        if win_cost is not None and loss_cost is not None:
+            data.update(win_cost=win_cost, loss_cost=loss_cost)
         return self._write(
             "INSERT INTO shadows (candidate, decision, multiplier, ts) VALUES (?, ?, ?, ?)",
-            (json.dumps(asdict(cand)), decision, multiplier, ts),
+            (json.dumps(data), decision, multiplier, ts),
         )
 
     def open_shadows(self) -> list[dict]:

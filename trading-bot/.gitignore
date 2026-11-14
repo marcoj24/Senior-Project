@@ -6,3 +6,4 @@ reports/
 bot.lock
 __pycache__/
 .pytest_cache/
+config.yaml

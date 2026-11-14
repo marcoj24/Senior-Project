@@ -214,7 +214,7 @@ def test_feeder_feeds_new_closed_candles_once_with_the_right_fill_flags():
 
 
 def test_check_places_nothing_and_records_a_pass(monkeypatch):
-    write_config()
+    write_config(mode="live")
     calls = []
 
     class Ex:
@@ -226,7 +226,7 @@ def test_check_places_nothing_and_records_a_pass(monkeypatch):
         def preview_stop(self, *a): calls.append(a)
 
     assert main(["check"], env_with(live_exchange=lambda k, s, p: Ex())) == 0
-    assert calls == [("BTC-USD", 1e-5, 80.0, pytest.approx(76.0))]
+    assert calls == [("BTC-USD", pytest.approx(0.05), 80.0, pytest.approx(76.0))]  # $5 at bid 100, rounded down to 1e-5 steps
     s = Store("bot.db")
     assert s.get_meta(cli.PREVIEW_META) == str(T0)
     s.close()
@@ -235,7 +235,9 @@ def test_check_places_nothing_and_records_a_pass(monkeypatch):
         def preview_stop(self, *a): raise ExchangeError("INVALID_STOP_DIRECTION")
 
     os.remove("bot.db")
-    assert main(["check"], env_with(live_exchange=lambda k, s, p: Bad())) == 1
+    lines = []
+    assert main(["check"], env_with(live_exchange=lambda k, s, p: Bad(), out=lines.append)) == 1
+    assert any("INVALID_STOP_DIRECTION" in l for l in lines)  # the venue's text is shown
     s = Store("bot.db")
     assert s.get_meta(cli.PREVIEW_META) is None
     s.close()
@@ -246,3 +248,45 @@ def test_status_prints_without_a_venue(capsys):
     lines = []
     assert main(["status"], env_with(out=lines.append)) == 0
     assert any(l.startswith("scorecard") for l in lines)
+
+
+def test_check_refuses_paper_mode_and_a_db_used_by_another_mode():
+    write_config()  # paper
+    assert main(["check"], env_with(live_exchange=boom)) == 2
+    assert not os.path.exists("bot.db")
+    write_config(mode="live")
+    s = Store("bot.db")
+    s.set_meta("mode", "paper")
+    s.close()
+    assert main(["check"], env_with(live_exchange=boom)) == 2
+
+
+def test_run_refuses_a_db_recorded_in_the_other_mode_and_records_the_mode():
+    write_config(mode="live")
+    s = Store("bot.db")
+    s.set_meta("mode", "paper")
+    s.close()
+    assert main(["run", "--i-understand-live"], env_with(live_exchange=boom)) == 2
+    os.remove("bot.db")
+    write_config()
+    data = FakeData()
+    env = env_with(public_data=lambda: data)
+    env.stop = lambda: True
+    assert main(["run"], env) == 0
+    s = Store("bot.db")
+    assert s.get_meta("mode") == "paper"
+    s.close()
+    write_config(mode="live")
+    assert main(["run", "--i-understand-live"], env_with(live_exchange=boom)) == 2
+
+
+def test_reset_refuses_when_the_kill_switch_is_not_latched():
+    write_config()
+    s = Store("bot.db")
+    s.save_risk_state(RiskState(25, "d", 10, False, 0, 0))
+    s.set_meta("last_equity", json.dumps({"usd": 20.0, "ts": T0}))
+    s.close()
+    assert main(["reset-kill-switch", "--confirm"], env_with()) == 2
+    s = Store("bot.db")
+    assert s.load_risk_state().peak_equity == 25
+    s.close()

@@ -66,9 +66,13 @@ is written to `reports/YYYY-MM-DD.txt` and sent as an alert at the first cycle o
 2. `python -m bot run --config config.yaml` in **paper** mode for two weeks. Paper starts with $25 simulated
    cash, fed by Coinbase public candles (no keys needed). The paper account lives in memory, so begin each
    paper run with a fresh `bot.db`.
-3. `python -m bot check --config config.yaml` with real keys: prints key permissions, fee tier, USD balance
-   and universe size, then **previews** a stop-limit sell on BTC-USD (nothing is placed). A PASS is recorded
-   and stays valid for 7 days.
+3. Before `check`, set `mode: live` and a fresh `db_path` (for example `live.db`) in the config, and keep a
+   separate database for paper (for example `paper.db`): the bot refuses to use a database in a mode other than
+   the one it first recorded. Then run `python -m bot check --config config.yaml` with real keys: it prints key
+   permissions, fee tier, USD balance and universe size, then **previews** a stop-limit sell on BTC-USD (about
+   $5 worth; nothing is placed). `check` refuses to run in paper mode. Only a clean preview counts as a PASS
+   (the SDK does not name an insufficient-funds error), so hold at least $6 of BTC in the bot's portfolio while
+   running `check`. A PASS is recorded in the live database and stays valid for 7 days.
 4. Live: set `mode: live` in the config **and** pass the flag:
    `python -m bot run --i-understand-live --config config.yaml`. Start refuses unless keys are present, the
    key cannot transfer funds, and a `check` PASS is less than 7 days old. Only one bot can run per
@@ -105,3 +109,14 @@ and halves risk for the next 10 trades. Without `--confirm` it does nothing.
 
 Press Ctrl-C or send SIGTERM. The bot finishes its current step and exits; protective stop orders stay on
 the exchange. To close positions, cancel and sell them on Coinbase yourself.
+
+`config.yaml` is git-ignored: it holds `alert_url` and `heartbeat_url`, which work like passwords.
+
+## Known limits not fixed
+
+- The paper feeder stops on an unexpected error (restart it).
+- Paper IOC exits fill at the next hourly close and paper stops fill at the trigger with no slippage, so paper is slightly optimistic.
+- A crash between a fill and the next save can make sale proceeds look like a deposit at restart (the kill switch then errs strict).
+- `backtest` reuses whatever is already in `data/` (delete it to refresh).
+- After you sell some of the bot's coins by hand, the remainder can sit without a stop for about 30 minutes.
+- The trade-review scorecard needs 40 reviewed candidates before its verdict means anything.

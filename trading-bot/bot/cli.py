@@ -22,7 +22,7 @@ from bot.models import Fees
 from bot.paperlive import PaperFeeder
 from bot.report import scorecard
 from bot.reviewer import Reviewer, anthropic_client
-from bot.risk import apply_transfer, reset_kill_switch
+from bot.risk import apply_transfer, reset_kill_switch, round_down
 from bot.signals import LOOKBACK_1D
 from bot.store import Store
 from bot.universe import prefilter
@@ -97,6 +97,16 @@ def load(args, env: Env) -> Config:
         return load_config(args.config)
     except ValueError as e:
         raise Exit(2, f"invalid config: {e}") from None
+
+
+def bind_mode(store: Store, cfg: Config) -> None:
+    """A database belongs to one mode: record it on first use and refuse a different one later."""
+    recorded = store.get_meta("mode")
+    if recorded is None:
+        store.set_meta("mode", cfg.mode)
+    elif recorded != cfg.mode:
+        raise Exit(2, f"{cfg.db_path} was used in {recorded} mode but the config says {cfg.mode}: "
+                      "use a separate db_path for each mode")
 
 
 def build_engine(cfg: Config, venue, store: Store, env: Env, alerts: Alerts, with_llm: bool) -> Engine:
@@ -175,6 +185,7 @@ def cmd_run(args, env: Env) -> int:
         if cfg.review_enabled and not env.environ.get("ANTHROPIC_API_KEY"):
             raise Exit(2, "review_enabled needs ANTHROPIC_API_KEY (or set review_enabled: false)")
         store = Store(cfg.db_path)
+        bind_mode(store, cfg)
         alerts = Alerts(cfg.alert_url, cfg.heartbeat_url)
         feeder = None
         if live:
@@ -219,8 +230,23 @@ def cmd_run(args, env: Env) -> int:
         lock.close()
 
 
+PREVIEW_USD = 5.0  # the stop preview is for a position worth about this much
+
+
 def cmd_check(args, env: Env) -> int:
     cfg = load(args, env)
+    if cfg.mode != "live":
+        raise Exit(2, "check uses your real keys and records its PASS for live trading: set `mode: live` "
+                      "and a fresh `db_path` (separate from the paper database) in the config first")
+    store = Store(cfg.db_path)
+    try:
+        bind_mode(store, cfg)
+        return _check(cfg, store, env)
+    finally:
+        store.close()
+
+
+def _check(cfg: Config, store: Store, env: Env) -> int:
     ex = env.live_exchange(*keys(env))
     perms = ex.key_permissions()
     env.out("key permissions: " + ", ".join(f"{k}={v}" for k, v in perms.items()))
@@ -233,17 +259,20 @@ def cmd_check(args, env: Env) -> int:
     if btc is None:
         env.out("stop preview FAIL: BTC-USD not listed")
         return 1
-    trigger = ex.bid_ask("BTC-USD")[0] * 0.8
+    bid = ex.bid_ask("BTC-USD")[0]
+    size = round_down(PREVIEW_USD / bid, btc.base_increment)
+    if size < btc.min_base_size or size <= 0:
+        env.out(f"stop preview FAIL: a ${PREVIEW_USD:.0f} preview size {size:g} is below the venue minimum")
+        return 1
+    trigger = bid * 0.8
     try:
-        ex.preview_stop("BTC-USD", btc.min_base_size, trigger, trigger * (1 - cfg.stop_limit_offset))
+        # The SDK reports preview errors as an untyped list (no insufficient-funds code is named), so only a
+        # clean preview passes; the bot's portfolio must hold about $6 of BTC for it.
+        ex.preview_stop("BTC-USD", size, trigger, trigger * (1 - cfg.stop_limit_offset))
     except ExchangeError as e:
         env.out(f"stop preview FAIL: {e}")
         return 1
-    store = Store(cfg.db_path)
-    try:
-        store.set_meta(PREVIEW_META, str(int(env.clock())))
-    finally:
-        store.close()
+    store.set_meta(PREVIEW_META, str(int(env.clock())))
     env.out("stop preview PASS (nothing was placed)")
     return 0
 
@@ -308,6 +337,8 @@ def cmd_reset(args, env: Env) -> int:
         state = store.load_risk_state()
         if state is None:
             raise Exit(2, "no risk state recorded yet")
+        if not state.kill_switch:
+            raise Exit(2, "the kill switch is not latched; resetting would erase the recorded drawdown")
         if cfg.mode == "live":
             equity = build_engine(cfg, env.live_exchange(*keys(env)), store, env, Alerts(), False).equity()
         else:

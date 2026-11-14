@@ -11,9 +11,15 @@ DAY = 86_400
 
 
 def resolve_shadow(shadow: dict, candles_after: list[Candle], cfg: Config) -> float | None:
-    """R result of a vetoed candidate had it been taken: +target_r if the target is passed before
-    the stop is touched, -1.0 if stopped first (the stop wins a tie within one candle), 0.0 if the
-    entry never traded through within entry_ttl_hours, None while still open."""
+    """R result of a vetoed candidate had it been taken, after costs: a win is
+    (target_frac - win_cost) / (stop_frac + loss_cost) when the shadow carries its costs (target_r
+    otherwise), a loss is -1.0 (that definition already includes costs; the stop wins a tie within one
+    candle), 0.0 if the entry never traded through within entry_ttl_hours, None while still open."""
+    win_r = cfg.target_r
+    if "win_cost" in shadow and "loss_cost" in shadow:
+        entry = shadow["entry"]
+        win_r = (((shadow["target"] - entry) / entry - shadow["win_cost"])
+                 / ((entry - shadow["stop"]) / entry + shadow["loss_cost"]))
     entered = False
     deadline = shadow["ts"] + cfg.entry_ttl_hours * HOUR
     for c in sorted(candles_after, key=lambda c: c.ts):
@@ -28,7 +34,7 @@ def resolve_shadow(shadow: dict, candles_after: list[Candle], cfg: Config) -> fl
             if c.low <= shadow["stop"]:
                 return -1.0
             if c.high > shadow["target"]:
-                return cfg.target_r
+                return win_r
     return None
 
 
@@ -39,8 +45,11 @@ def _avg(xs: list[float]) -> float:
 def scorecard(store: Store, cfg: Config) -> dict:
     vetoed = [s["r_multiple"] for s in store.closed_shadows()
               if s["decision"] == "veto" and s["r_multiple"] is not None]
+    # taken: closed trades whose entry Claude really reviewed and approved or reduced
+    reviewed_orders = {r["data"].get("order_id") for r in store.journal_rows("entry_placed")
+                       if r["data"].get("replied") and r["data"].get("decision") in ("approve", "reduce")}
     taken = [r["data"]["r_multiple"] for r in store.journal_rows("trade_closed")
-             if r["data"].get("r_multiple") is not None]
+             if r["data"].get("r_multiple") is not None and r["data"].get("entry_order") in reviewed_orders]
     reviewed = len(vetoed) + len(taken)
     v_avg, t_avg = _avg(vetoed), _avg(taken)
     if reviewed < cfg.scorecard_min:

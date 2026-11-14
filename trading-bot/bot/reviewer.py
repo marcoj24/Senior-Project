@@ -36,6 +36,7 @@ class EntryDecision:
     multiplier: float
     invalidation: str
     reason: str
+    replied: bool = False  # True only when Claude actually answered (not budget, disabled or invalid reply)
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,7 @@ class Reviewer:
             mult = _clamp01(mult)
         else:
             mult = 0.0
-        return EntryDecision(decision, mult, invalidation, reason)
+        return EntryDecision(decision, mult, invalidation, reason, True)
 
     @staticmethod
     def _parse_regime(reply: str, system_label: str) -> RegimeDecision:

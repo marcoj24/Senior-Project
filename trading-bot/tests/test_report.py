@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime, timezone
 
 from bot.config import Config
@@ -22,6 +23,22 @@ def test_resolve_shadow_four_outcomes():
     assert resolve_shadow(SHADOW, [c(0, 99, 105), c(1, 98, 110)], CFG) is None  # still open
 
 
+def test_shadow_win_is_scored_after_costs():
+    # stop 10%, target 20%; win cost 0.5%, loss cost 1%: (0.20 - 0.005) / (0.10 + 0.01)
+    sh = {**SHADOW, "win_cost": 0.005, "loss_cost": 0.01}
+    assert resolve_shadow(sh, [c(0, 99, 105), c(1, 100, 121)], CFG) == pytest.approx(0.195 / 0.11)
+    assert resolve_shadow(sh, [c(0, 99, 105), c(1, 89, 110)], CFG) == -1.0
+    assert resolve_shadow(sh, [c(i, 100, 110) for i in range(0, 25)], CFG) == 0.0
+
+
+def test_taken_counts_only_trades_reviewed_by_a_real_reply():
+    s = Store(":memory:")
+    add_trades(s, 3, 0.5)
+    add_trades(s, 2, 9.0, reviewed=False)  # budget or disabled review: not a reviewed candidate
+    sc = scorecard(s, CFG)
+    assert sc["reviewed"] == 3 and sc["taken_avg_r"] == 0.5
+
+
 def add_closed(store, n, decision, r):
     cand = Candidate("SOL-USD", 100, 90, 120, 5, 99, 1.0, T)
     for _ in range(n):
@@ -29,9 +46,12 @@ def add_closed(store, n, decision, r):
         store.close_shadow(sid, r)
 
 
-def add_trades(store, n, r, pnl=1.0, ts=T):
+def add_trades(store, n, r, pnl=1.0, ts=T, reviewed=True, decision="approve"):
     for i in range(n):
-        store.journal("trade_closed", "SOL-USD", {"trade_id": f"{r}-{i}-{ts}", "pnl_usd": pnl, "r_multiple": r}, ts)
+        oid = f"o{r}-{i}-{ts}"
+        store.journal("entry_placed", "SOL-USD", {"order_id": oid, "decision": decision, "replied": reviewed}, ts)
+        store.journal("trade_closed", "SOL-USD", {"trade_id": f"{r}-{i}-{ts}", "pnl_usd": pnl, "r_multiple": r,
+                                                  "entry_order": oid}, ts)
 
 
 def test_scorecard_insufficient_below_minimum():
