@@ -187,3 +187,19 @@ def test_deposits_are_transfers(px):
     assert px.transfers(0) == [Transfer(100, 50.0)] and px.transfers(101) == []
     assert px.balances()["USD"] == 1050.0
     assert px.can_transfer() is False
+
+
+def test_get_order_by_client_id(px):
+    oid = px.place_entry("SOL-USD", 0.1, 100.0, "mine")
+    assert px.get_order_by_client_id("mine").order_id == oid
+    assert px.get_order_by_client_id("nobody") is None
+
+
+def test_fail_after_next_performs_the_call_then_raises_once(px):
+    px.fail_after_next = "place_entry"
+    with pytest.raises(ExchangeError):
+        px.place_entry("SOL-USD", 0.1, 100.0, "lost")
+    assert px.fail_after_next is None
+    o = px.get_order_by_client_id("lost")
+    assert o is not None and o.status == "open" and o.base_size == 0.1
+    px.place_entry("SOL-USD", 0.1, 100.0, "next")  # only once

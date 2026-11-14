@@ -49,7 +49,8 @@ class PaperExchange:
     def __init__(self, cash: float, fees: Fees, products: list[Product], supports_bracket: bool = True,
                  spread: float = 0.001):
         self.supports_bracket = supports_bracket
-        self.fail_next: str | None = None
+        self.fail_next: str | None = None  # the named call raises instead of running, once
+        self.fail_after_next: str | None = None  # the named call runs, then raises, once (lost reply)
         self._cash = cash
         self._coins: dict[str, float] = {}
         self._fees = fees
@@ -93,6 +94,12 @@ class PaperExchange:
             self.fail_next = None
             raise ExchangeError(f"injected failure in {method}")
 
+    def _fail_after(self, method: str, result: str) -> str:
+        if self.fail_after_next == method:
+            self.fail_after_next = None
+            raise ExchangeError(f"injected lost reply in {method}")
+        return result
+
     def products(self) -> list[Product]:
         self._maybe_fail("products")
         return list(self._products.values())
@@ -128,7 +135,7 @@ class PaperExchange:
         )
         if self._cash - reserved + _EPS < base_size * limit_price * (1 + self._fees.maker):
             raise ExchangeError("insufficient free cash")
-        return self._add(client_order_id, product_id, "entry", base_size, limit_price, None, None)
+        return self._fail_after("place_entry", self._add(client_order_id, product_id, "entry", base_size, limit_price, None, None))
 
     def place_bracket(self, product_id: str, base_size: float, stop_trigger: float, stop_limit: float,
                       target: float, client_order_id: str) -> str:
@@ -141,7 +148,7 @@ class PaperExchange:
         if not stop_limit <= stop_trigger < target:
             raise ExchangeError("bracket needs stop_limit <= stop_trigger < target")
         self._check_sell_hold(product_id, base_size)
-        return self._add(client_order_id, product_id, "bracket", base_size, stop_limit, stop_trigger, target)
+        return self._fail_after("place_bracket", self._add(client_order_id, product_id, "bracket", base_size, stop_limit, stop_trigger, target))
 
     def place_stop(self, product_id: str, base_size: float, stop_trigger: float, stop_limit: float,
                    client_order_id: str) -> str:
@@ -152,7 +159,7 @@ class PaperExchange:
         if stop_limit > stop_trigger:
             raise ExchangeError("stop needs stop_limit <= stop_trigger")
         self._check_sell_hold(product_id, base_size)
-        return self._add(client_order_id, product_id, "stop", base_size, stop_limit, stop_trigger, None)
+        return self._fail_after("place_stop", self._add(client_order_id, product_id, "stop", base_size, stop_limit, stop_trigger, None))
 
     def place_ioc_sell(self, product_id: str, base_size: float, limit_price: float, client_order_id: str) -> str:
         self._maybe_fail("place_ioc_sell")
@@ -160,7 +167,7 @@ class PaperExchange:
             return self._by_client_id[client_order_id]
         self._check_order(product_id, base_size, limit_price)
         self._check_sell_hold(product_id, base_size)
-        return self._add(client_order_id, product_id, "ioc", base_size, limit_price, None, None)
+        return self._fail_after("place_ioc_sell", self._add(client_order_id, product_id, "ioc", base_size, limit_price, None, None))
 
     def cancel(self, order_id: str) -> None:
         """Cancels an open order; cancelling an order that is already filled or cancelled does nothing."""
@@ -176,6 +183,11 @@ class PaperExchange:
     def get_order(self, order_id: str) -> Order:
         self._maybe_fail("get_order")
         return self._get(order_id).snapshot()
+
+    def get_order_by_client_id(self, client_order_id: str) -> Order | None:
+        self._maybe_fail("get_order_by_client_id")
+        oid = self._by_client_id.get(client_order_id)
+        return self._orders[oid].snapshot() if oid else None
 
     def fills(self, since_ts: int) -> list[Fill]:
         self._maybe_fail("fills")

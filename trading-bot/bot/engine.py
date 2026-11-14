@@ -34,6 +34,7 @@ _EPS = 1e-9
 BTC = "BTC-USD"
 H4_LIMIT = 200
 FORCED_EXIT_PRICE = 0.98  # IOC limit as a fraction of bid
+TARGET_EXIT_PRICE = 0.995  # bot-managed target (venue without brackets): IOC limit as a fraction of bid
 FAILED_CYCLES_ALERT = 3
 SETUP_MEMORY_S = 7 * D1
 FILL_LOOKBACK_S = 7 * D1  # fills window for an order whose exchange timestamp is unknown
@@ -70,6 +71,7 @@ class Engine:
         self._products: dict[str, Product] = {}
         self._daily_cache: dict[str, list] = {}
         self._grown: set[str] = set()
+        self._target_missed: set[str] = set()
         self._exited: list[str] = []
 
     # ---------------------------------------------------------------- persistence helpers
@@ -87,7 +89,7 @@ class Engine:
         self.trades: dict[str, dict] = self._meta("trades", {})
         self.setups: dict[str, dict] = self._meta("setups", {})
         self.state = self.store.load_risk_state()
-        self._grown, self._exited, self._daily_cache = set(), [], {}
+        self._grown, self._target_missed, self._exited, self._daily_cache = set(), set(), [], {}
 
     def _save_orders(self) -> None:
         self._set_meta("orders", self.orders)
@@ -133,6 +135,7 @@ class Engine:
     def watch_fills(self) -> None:
         self._load()
         try:
+            self._resolve_intents(None)
             entries = self._entries()
             if not entries:
                 return
@@ -185,9 +188,10 @@ class Engine:
     def _sync(self, res: CycleResult) -> None:
         self._products = {p.product_id: p for p in self.ex.products()}
         self._sync_transfers()
-        self._adopt_pending_entries()
+        self._resolve_intents(res)
         self._sync_orders(None)
         self._protect_grown(res)
+        self._cover_missed_targets(res)
         for pid in list(self.pos):
             pos = self.pos[pid]
             if pos.half_taken and pos.stop_price < pos.entry_price:
@@ -212,23 +216,33 @@ class Engine:
         self.store.save_risk_state(self.state)
         self._set_meta("transfer_cursor", cur)
 
-    def _adopt_pending_entries(self) -> None:
-        """An entry whose placement call failed may still exist: adopt it by its client order id."""
+    def _resolve_intents(self, res: CycleResult | None) -> None:
+        """An entry whose placement call raised may still exist on the exchange. Look each one up by
+        its client order id: if it exists it is the bot's own order and is adopted (and protected at
+        once if it has filled); if not, the intent is dropped and the setup may be placed again."""
         pending = {k: s for k, s in self.setups.items() if s["status"] == "placing"}
-        if not pending:
-            return
-        by_cid = {o.client_order_id: o for o in self.ex.open_orders()}
+        recovered = []
         for key, s in pending.items():
-            o = by_cid.get(key)
-            if o is not None:
-                if o.order_id not in self.orders:
-                    self._register(o.order_id, "entry", o.product_id, key, o.base_size,
-                                   candidate=s["candidate"], limit=o.limit_price, placed_ts=s["ts"])
-                    self._log("entry_adopted", o.product_id, order_id=o.order_id, client_order_id=key)
-                s["status"] = "placed"
-            else:
-                del self.setups[key]  # never reached the exchange; the setup may be retried
-        self._save_setups()
+            o = self.ex.get_order_by_client_id(key)
+            if o is None:
+                s["status"] = "dropped"
+                self._save_setups()
+                self._log("entry_intent_dropped", s["candidate"]["product_id"], client_order_id=key)
+                continue
+            if o.order_id not in self.orders:
+                self._register(o.order_id, "entry", o.product_id, key, o.base_size,
+                               candidate=s["candidate"], limit=o.limit_price, placed_ts=s["ts"])
+                recovered.append(o)
+            s["status"] = "placed"
+            self._save_setups()
+            self._log("entry_adopted", o.product_id, order_id=o.order_id, client_order_id=key,
+                      status=o.status, filled_size=o.filled_size)
+        if recovered:
+            self._sync_orders({"entry"})
+            self._protect_grown(res)
+            for o in recovered:
+                self._alert("recovered entry", f"{o.product_id}: entry {o.client_order_id} was placed although "
+                                               f"the call failed; filled {o.filled_size} of {o.base_size}")
 
     def _entry_changed(self, oid: str, rec: dict) -> bool:
         o = self.ex.get_order(oid)
@@ -263,6 +277,8 @@ class Engine:
             if o.status != "open" and o.filled_size <= rec["acc_size"] + _EPS:
                 del self.orders[oid]
                 self._save_orders()
+                if rec.get("purpose") == "target" and rec["acc_size"] < rec["size"] - _EPS:
+                    self._target_missed.add(rec["product_id"])
                 if leg is not None and rec["product_id"] in self.pos:
                     pos.legs.remove(leg)
                     self.store.save_position(pos)
@@ -306,7 +322,7 @@ class Engine:
         for leg in pos.legs:
             if leg.order_id == oid:
                 leg.base_size = max(0.0, _sub(leg.base_size, size))
-        if reason == "target":
+        if reason == "target" or rec.get("purpose") == "target":
             pos.half_taken = True
         if pos.base_size <= _EPS:
             self._close_trade(pos, reason)
@@ -390,8 +406,8 @@ class Engine:
 
     def _protect_position(self, pos: Position) -> None:
         pid = pos.product_id
-        if any(r["kind"] == "ioc" and r["product_id"] == pid for r in self.orders.values()):
-            return  # a forced exit is in flight
+        if self._ioc_in_flight(pid):
+            return  # a forced or target exit is in flight
         bid, _ = self.ex.bid_ask(pid)
         if bid < pos.stop_price:
             self._forced_exit(pos, bid)
@@ -444,15 +460,19 @@ class Engine:
         if size < p.min_base_size:
             self._alert("unprotected", f"{pid}: {pos.base_size} is below the minimum order size")
             return
-        a = round_down(size / 2, p.base_increment)
-        b = _sub(size, a)
-        if (not pos.half_taken and self.ex.supports_bracket
-                and a >= p.min_base_size and b >= p.min_base_size):
-            self._place_leg(pos, "bracket", a, pos.stop_price)
-            self._place_leg(pos, "stop", b, pos.stop_price)
+        split = None if pos.half_taken else self._split(size, p)
+        if split:  # leg a carries the target: a bracket, or a plain stop the bot sells itself at target
+            self._place_leg(pos, "bracket" if self.ex.supports_bracket else "stop", split[0], pos.stop_price)
+            self._place_leg(pos, "stop", split[1], pos.stop_price)
         else:
             self._place_leg(pos, "stop", size, pos.stop_price)
         self._log("protect", pid, size=size, legs=[asdict(leg) for leg in pos.legs])
+
+    @staticmethod
+    def _split(size: float, p: Product) -> tuple[float, float] | None:
+        a = round_down(size / 2, p.base_increment)
+        b = _sub(size, a)
+        return (a, b) if a >= p.min_base_size and b >= p.min_base_size else None
 
     def _place_leg(self, pos: Position, kind: str, size: float, stop: float) -> None:
         pid = pos.product_id
@@ -496,7 +516,9 @@ class Engine:
     def _trail_all(self, res: CycleResult) -> None:
         for pid in list(self.pos):
             try:
-                self._trail(self.pos[pid])
+                self._manage_target(self.pos[pid], res)
+                if pid in self.pos:
+                    self._trail(self.pos[pid])
             except ExchangeError as e:
                 res.errors.append(f"trail {pid}: {e}")
 
@@ -509,15 +531,77 @@ class Engine:
             self.store.save_position(pos)
         cur = atr(c4h, 14)[-1] if len(c4h) >= 14 else None
         a = cur if cur else pos.atr
-        if any(r["kind"] == "ioc" and r["product_id"] == pid for r in self.orders.values()):
+        if self._ioc_in_flight(pid):
             return
         bid, _ = self.ex.bid_ask(pid)
-        no_bracket = not any(leg.kind == "bracket" for leg in pos.legs)
-        if not (pos.half_taken or (no_bracket and max(pos.highest_close, bid) >= pos.target_price)):
+        p = self._product(pid)
+        too_small = self._split(round_down(pos.base_size, p.base_increment), p) is None
+        if not (pos.half_taken or (too_small and max(pos.highest_close, bid) >= pos.target_price)):
             return
         new_stop = pos.highest_close - self.cfg.stop_atr_mult * a
         if new_stop - pos.stop_price >= self.cfg.trail_min_improve_atr * a - _EPS and new_stop < bid:
             self._replace_stop(pos, new_stop, "trail")
+
+    def _manage_target(self, pos: Position, res: CycleResult) -> None:
+        """Venue without brackets: at the target, sell leg a with an IOC; leg b moves to break-even
+        once that fills (sync), and leg a's stop is re-placed at once if it does not."""
+        pid = pos.product_id
+        if self.ex.supports_bracket or pos.half_taken or self._ioc_in_flight(pid):
+            return
+        p = self._product(pid)
+        split = self._split(round_down(pos.base_size, p.base_increment), p)
+        bid, _ = self.ex.bid_ask(pid)
+        if split is None or bid < pos.target_price:
+            return
+        leg = next((lg for lg in pos.legs if lg.kind == "stop" and abs(lg.base_size - split[0]) <= _EPS), None)
+        if leg is None:
+            return  # legs are not in their two-stop shape; protect restores it next cycle
+        self.ex.cancel(leg.order_id)
+        pos.legs.remove(leg)
+        self.store.save_position(pos)
+        self._sync_orders(None)  # leg a may have filled before the cancel landed
+        if pid not in self.pos:
+            return
+        size = min(split[0], _sub(round_down(pos.base_size, p.base_increment),
+                                  sum(lg.base_size for lg in pos.legs)))
+        if size >= p.min_base_size:
+            limit = round_down(bid * TARGET_EXIT_PRICE, p.quote_increment)
+            cid = self._cid(pid, "ioc")
+            try:
+                oid = self.ex.place_ioc_sell(pid, size, limit, cid)
+                self._register(oid, "ioc", pid, cid, size, purpose="target")
+                self._log("target_exit", pid, order_id=oid, size=size, limit=limit, bid=bid,
+                          target=pos.target_price)
+            except ExchangeError as e:
+                self._log("error", pid, where="target_exit", error=str(e))
+                self._target_missed.add(pid)
+            self._sync_orders(None)  # an IOC that is already done is accounted now
+        self._cover_missed_targets(res)
+
+    def _cover_missed_targets(self, res: CycleResult | None) -> None:
+        """Re-place a stop at once for coins a target IOC did not sell."""
+        for pid in sorted(self._target_missed):
+            self._target_missed.discard(pid)
+            pos = self.pos.get(pid)
+            if pos is None or self._ioc_in_flight(pid):
+                continue
+            try:
+                p = self._product(pid)
+                open_ids = {o.order_id for o in self.ex.open_orders()}
+                covered = sum(lg.base_size for lg in pos.legs if lg.order_id in open_ids)
+                gap = _sub(round_down(pos.base_size, p.base_increment), covered)
+                if gap >= p.min_base_size:
+                    self._place_leg(pos, "stop", gap, pos.stop_price)
+                elif gap > _EPS:
+                    self._alert("unprotected", f"{pid}: {gap} uncovered is below the minimum order size")
+            except ExchangeError as e:
+                self._alert("unprotected", f"{pid}: target IOC did not fill and the stop could not be "
+                                           f"re-placed: {e}")
+                if res is not None:
+                    res.errors.append(f"target {pid}: {e}")
+
+    def _ioc_in_flight(self, pid: str) -> bool:
+        return any(r["kind"] == "ioc" and r["product_id"] == pid for r in self.orders.values())
 
     def _replace_stop(self, pos: Position, new_stop: float, why: str) -> None:
         """Verified cancel-and-replace of the stop legs at a higher stop. Stops never move down."""
@@ -703,7 +787,7 @@ class Engine:
         if p.status != "online":
             return f"status {p.status}"
         key = f"{pid}-{cand.setup_ts}"
-        if key in self.setups:
+        if key in self.setups and self.setups[key]["status"] != "dropped":
             return f"setup already {self.setups[key]['status']}"
         if not correlation_ok(pid, held, regime):
             return "correlation"
@@ -743,8 +827,14 @@ class Engine:
             return final.skipped
         base = min(final.base_size, first.base_size)
         limit = round_down(cand.entry, p.quote_increment)
-        self._remember(key, "placing", cand)  # intent first: a lost reply is adopted next cycle
-        oid = self.ex.place_entry(pid, base, limit, key)
+        self._remember(key, "placing", cand)  # intent first: a lost reply is resolved by client id
+        self._log("entry_intent", pid, client_order_id=key, base_size=base, limit=limit,
+                  stop=cand.stop, target=cand.target, atr=cand.atr)
+        try:
+            oid = self.ex.place_entry(pid, base, limit, key)
+        except ExchangeError as e:
+            self._log("entry_place_failed", pid, client_order_id=key, error=str(e))
+            raise
         self._register(oid, "entry", pid, key, base, candidate=asdict(cand), limit=limit)
         self._remember(key, "placed", cand)
         self._log("entry_placed", pid, order_id=oid, client_order_id=key, base_size=base, limit=limit,

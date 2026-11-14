@@ -350,7 +350,12 @@ def test_exchange_error_mid_cycle_is_safe():
     w.ex.fail_next = "place_entry"
     r = w.cycle()
     assert r.errors and r.entered == [] and w.entries() == [] and w.position() is None
-    r = w.cycle()
+    [intent] = w.store.journal_rows("entry_intent")  # journaled before the call
+    assert intent["data"]["client_order_id"] == f"SOL-USD-{w.c4h[-3].ts}"
+    assert intent["data"]["stop"] == pytest.approx(STOP) and intent["data"]["limit"] == pytest.approx(ENTRY)
+    r = w.cycle()  # no such order on the exchange: the intent is dropped and the setup placed normally
+    assert [row["data"]["client_order_id"] for row in w.store.journal_rows("entry_intent_dropped")] == [
+        intent["data"]["client_order_id"]]
     assert r.entered == ["SOL-USD"] and len(w.entries()) == 1
     r = w.cycle()
     assert r.entered == [] and len(w.entries()) == 1  # no duplicate
@@ -392,6 +397,34 @@ def test_one_broken_position_does_not_block_protecting_the_others():
     assert any("SOL-USD" in e for e in r.errors)
     assert w.sells("AVAX-USD") == pytest.approx(avax.base_size)  # AVAX was still repaired
     assert r.entered == []
+
+
+def test_lost_reply_entry_fills_and_is_recovered():
+    w = World()
+    w.ex.fail_after_next = "place_entry"  # the venue creates the order, the reply is lost
+    r = w.cycle()
+    assert r.errors and r.entered == []
+    [order] = w.entries()
+    w.bar(121.0)  # it fills before the bot has ever seen it
+    assert w.ex.get_order(order.order_id).status == "filled"
+    w.watch()  # resolves the intent, adopts the fill and protects it at once
+    pos = w.position()
+    assert pos.base_size == pytest.approx(order.base_size) and pos.entry_price == pytest.approx(ENTRY)
+    assert w.sells() == pytest.approx(order.base_size)
+    assert "recovered entry" in w.titles()
+    r = w.cycle()
+    assert r.entered == [] and len(w.ex._orders) == 3  # entry + two legs: no second order for the setup
+
+
+def test_unresolved_intent_blocks_a_second_order():
+    w = World()
+    w.ex.fail_after_next = "place_entry"
+    w.cycle()
+    w.ex.fail_next = "get_order_by_client_id"  # the intent cannot be resolved this cycle
+    r = w.cycle()
+    assert r.errors and len(w.ex._orders) == 1
+    r = w.cycle()
+    assert r.entered == [] and len(w.ex._orders) == 1 and len(w.entries()) == 1
 
 
 def test_partial_fill_then_expiry_is_protected():
@@ -483,9 +516,10 @@ def test_restart_rebuilds_from_exchange():
     assert w.position().half_taken and w.position().stop_price >= ENTRY
 
 
-def test_without_brackets_one_stop_trails_after_target():
-    w = World(brackets=False)
+def test_too_small_to_split_trails_whole_after_target():
+    w = World(cfg=Config(risk_per_trade=0.0003))  # ~0.015 SOL: halves would be below the 0.01 minimum
     pos = w.enter()
+    assert pos.base_size < 0.02
     assert [leg.kind for leg in pos.legs] == ["stop"] and pos.legs[0].base_size == pos.base_size
     for close in (130.0, 140.0, 150.0):
         w.bar(close)
@@ -496,6 +530,68 @@ def test_without_brackets_one_stop_trails_after_target():
     pos = w.position()
     assert not pos.half_taken and pos.stop_price > ENTRY  # whole position trails once 2R is reached
     assert w.sells() == pytest.approx(pos.base_size)
+
+
+def test_without_brackets_bot_sells_half_at_target_lifecycle():
+    w = World(brackets=False)
+    pos = w.enter()
+    size = pos.base_size
+    a = round_down(size / 2, 0.001)
+    assert sorted(leg.base_size for leg in pos.legs) == pytest.approx(sorted([a, size - a]))
+    assert [leg.kind for leg in pos.legs] == ["stop", "stop"]
+    for close in (130.0, 140.0, 150.0):
+        w.bar(close)
+        w.cycle()
+    assert [o.kind for o in w.ex.open_orders()] == ["stop", "stop"]  # below target: nothing sold
+    w.bar(160.0)
+    w.cycle()  # bid >= target: leg a's stop becomes an IOC sell
+    [ioc] = [o for o in w.ex.open_orders() if o.kind == "ioc"]
+    assert ioc.base_size == pytest.approx(a)
+    assert ioc.limit_price == pytest.approx(160.0 * (1 - 0.0005) * 0.995, abs=0.01)
+    w.bar(161.0)  # the IOC fills
+    w.cycle()
+    pos = w.position()
+    assert pos.half_taken and pos.base_size == pytest.approx(size - a) and pos.stop_price >= ENTRY
+    moves = [r["data"] for r in w.store.journal_rows("stop_moved")]
+    assert moves[0]["why"] == "break-even" and moves[0]["new_stop"] == pytest.approx(ENTRY)
+    for close in (170.0, 180.0):
+        w.bar(close)
+        w.cycle()
+    assert w.position().stop_price > ENTRY + 20  # trailing applies as usual
+    w.bar(140.0)
+    r = w.cycle()
+    assert r.exited == ["SOL-USD"] and w.position() is None
+    [closed] = w.store.journal_rows("trade_closed")
+    assert closed["data"]["pnl_usd"] > 0
+    first = closed["data"]["exits"][0]
+    assert first["reason"] == "ioc" and first["size"] == pytest.approx(a) and first["price"] >= TARGET * 0.995
+
+
+def test_without_brackets_unfilled_target_ioc_restores_the_stop():
+    w = World(brackets=False)
+    pos = w.enter()
+    for close in (130.0, 140.0, 150.0, 160.0):
+        w.bar(close)
+        w.cycle()
+    assert any(o.kind == "ioc" for o in w.ex.open_orders())
+    w.bar(150.0)  # closes below the IOC limit: it cancels unfilled
+    w.cycle()
+    pos = w.position()
+    assert not pos.half_taken and w.sells() == pytest.approx(pos.base_size)
+    assert [o.kind for o in w.ex.open_orders()] == ["stop", "stop"]
+    assert "missing stop" not in w.titles()  # re-placed at once, not by the repair path
+
+
+def test_without_brackets_failed_target_ioc_recovers_stop_in_same_cycle():
+    w = World(brackets=False)
+    w.enter()
+    for close in (130.0, 140.0, 150.0):
+        w.bar(close)
+        w.cycle()
+    w.bar(160.0)
+    w.ex.fail_next = "place_ioc_sell"
+    w.cycle()  # check_covered: leg a's stop is back before the cycle ends
+    assert [o.kind for o in w.ex.open_orders()] == ["stop", "stop"] and not w.position().half_taken
 
 
 def test_withdrawal_is_not_counted_as_a_loss():
