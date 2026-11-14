@@ -10,6 +10,7 @@ Safety rules kept throughout:
 
 import json
 import math
+import traceback
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -88,6 +89,7 @@ class Engine:
         self.orders: dict[str, dict] = self._meta("orders", {})
         self.trades: dict[str, dict] = self._meta("trades", {})
         self.setups: dict[str, dict] = self._meta("setups", {})
+        self.pending: dict[str, dict] = self._meta("pending", {})  # exit/leg placements not yet registered
         self.state = self.store.load_risk_state()
         self._grown, self._target_missed, self._exited, self._daily_cache = set(), set(), [], {}
 
@@ -99,6 +101,9 @@ class Engine:
 
     def _save_setups(self) -> None:
         self._set_meta("setups", self.setups)
+
+    def _save_pending(self) -> None:
+        self._set_meta("pending", self.pending)
 
     def _log(self, _kind: str, _pid: str | None, /, **data) -> None:
         self.store.journal(_kind, _pid, data, self.now())
@@ -132,30 +137,47 @@ class Engine:
         cash = self.ex.balances().get("USD", 0.0)
         return cash + sum(p.base_size * self.ex.bid_ask(pid)[0] for pid, p in self.pos.items())
 
-    def watch_fills(self) -> None:
-        self._load()
+    def needs_watch(self) -> bool:
+        """True while an entry rests, an order placement is unresolved, or a position is not fully
+        covered by its open sell legs: the main loop then calls watch_fills every few seconds."""
         try:
-            self._resolve_intents(None)
+            self._load()
+            if self._entries() or self.pending or any(s["status"] == "placing" for s in self.setups.values()):
+                return True
+            if not self.pos:
+                return False
+            open_ids = {o.order_id for o in self.ex.open_orders()}
+            return any(self._uncovered(pos, open_ids) for pos in self.pos.values())
+        except Exception as e:  # cannot tell: keep watching
+            self._log("error", None, where="needs_watch", error=repr(e))
+            return True
+
+    def watch_fills(self) -> None:
+        """Fill poll: resolve lost replies, account entry fills, then re-protect ANY position whose
+        open legs do not cover it, so an uncovered position is retried on every poll."""
+        self._load()
+        self._resolve_all(None)
+
+        def entry_fills():
             entries = self._entries()
-            if not entries:
-                return
-            if any(self._entry_changed(oid, rec) for oid, rec in entries.items()):
-                self._sync_orders({"entry"})
-                self._protect_grown(None)
-        except ExchangeError as e:
-            self._log("error", None, where="watch_fills", error=str(e))
+            if entries and any(self._entry_changed(oid, rec) for oid, rec in entries.items()):
+                self._sync_orders(None)
+
+        if self._guard(None, None, "watch_fills", entry_fills):
+            self._protect_grown(None)
+            self._repair_coverage()
 
     def run_cycle(self) -> CycleResult:
         self._load()
         res = CycleResult()
         try:
-            self._step(res, "sync", self._sync)
-            if not res.errors:  # per-position steps: one broken position never blocks the others
-                self._step(res, "reconcile", self._reconcile)
-                self._protect_all(res)
-                self._trail_all(res)
-            if not res.errors:
-                self._step(res, "entries", self._limits_and_entries)
+            if self._step(res, "sync", self._sync):  # without a sync the bot's view is stale
+                self._after_sync(res)
+                self._step(res, "reconcile", self._reconcile)  # per-position steps from here:
+                self._protect_all(res)                           # one broken position never blocks
+                self._trail_all(res)                             # protecting the others
+                entries_ok = not res.errors
+                self._step(res, "limits", lambda r: self._limits_and_entries(r, entries_ok))
         finally:
             res.exited = list(self._exited)
             self._record(res)
@@ -163,14 +185,27 @@ class Engine:
 
     # ---------------------------------------------------------------- cycle plumbing
 
-    def _step(self, res: CycleResult, name: str, fn) -> None:
-        if res.errors:
-            return
+    def _step(self, res: CycleResult, name: str, fn) -> bool:
+        return self._guard(res, None, name, lambda: fn(res))
+
+    def _guard(self, res: CycleResult | None, pid: str | None, where: str, fn, alert: str | None = None) -> bool:
+        """Run one unit of work. An ExchangeError, or any unexpected error, is journaled, recorded
+        and (unexpected ones always) alerted; it never escapes, so the next unit still runs."""
         try:
-            fn(res)
+            fn()
+            return True
         except ExchangeError as e:
-            res.errors.append(f"{name}: {e}")
-            self._log("error", None, where=name, error=str(e))
+            self._log("error", pid, where=where, error=str(e))
+            if alert:
+                self._alert(alert, f"{pid or where}: {e}")
+            msg = str(e)
+        except Exception as e:
+            self._log("error", pid, where=where, error=repr(e), traceback=traceback.format_exc())
+            self._alert("engine error", f"{where} {pid or ''}: {e!r}")
+            msg = repr(e)
+        if res is not None:
+            res.errors.append(f"{where} {pid}: {msg}" if pid else f"{where}: {msg}")
+        return False
 
     def _record(self, res: CycleResult) -> None:
         if self.state is not None:
@@ -188,14 +223,18 @@ class Engine:
     def _sync(self, res: CycleResult) -> None:
         self._products = {p.product_id: p for p in self.ex.products()}
         self._sync_transfers()
-        self._resolve_intents(res)
+        self._resolve_all(res)
         self._sync_orders(None)
+
+    def _after_sync(self, res: CycleResult) -> None:
+        """Per position: protect new entry fills, re-cover missed targets, move to break-even."""
         self._protect_grown(res)
         self._cover_missed_targets(res)
         for pid in list(self.pos):
-            pos = self.pos[pid]
-            if pos.half_taken and pos.stop_price < pos.entry_price:
-                self._replace_stop(pos, pos.entry_price, "break-even")
+            pos = self.pos.get(pid)
+            if pos and pos.half_taken and pos.stop_price < pos.entry_price:
+                self._guard(res, pid, "break-even", lambda: self._replace_stop(pos, pos.entry_price, "break-even"),
+                            alert="protection failed")
 
     def _sync_transfers(self) -> None:
         if self.state is None:
@@ -216,33 +255,86 @@ class Engine:
         self.store.save_risk_state(self.state)
         self._set_meta("transfer_cursor", cur)
 
-    def _resolve_intents(self, res: CycleResult | None) -> None:
-        """An entry whose placement call raised may still exist on the exchange. Look each one up by
-        its client order id: if it exists it is the bot's own order and is adopted (and protected at
-        once if it has filled); if not, the intent is dropped and the setup may be placed again."""
-        pending = {k: s for k, s in self.setups.items() if s["status"] == "placing"}
-        recovered = []
-        for key, s in pending.items():
-            o = self.ex.get_order_by_client_id(key)
-            if o is None:
-                s["status"] = "dropped"
-                self._save_setups()
-                self._log("entry_intent_dropped", s["candidate"]["product_id"], client_order_id=key)
-                continue
-            if o.order_id not in self.orders:
-                self._register(o.order_id, "entry", o.product_id, key, o.base_size,
-                               candidate=s["candidate"], limit=o.limit_price, placed_ts=s["ts"])
-                recovered.append(o)
-            s["status"] = "placed"
+    def _resolve_all(self, res: CycleResult | None) -> None:
+        """Lost replies: look each unresolved placement up by client order id, one at a time.
+        A failed lookup leaves that placement unresolved and never blocks fill accounting."""
+        for key in [k for k, s in self.setups.items() if s["status"] == "placing"]:
+            self._guard(res, self.setups[key]["candidate"].get("product_id"), "resolve entry",
+                        lambda: self._resolve_entry(key))
+        for cid in list(self.pending):
+            self._guard(res, self.pending[cid]["product_id"], "resolve order", lambda: self._resolve_order(cid))
+
+    def _resolve_entry(self, key: str) -> None:
+        """An entry whose placement call raised may still exist: if so it is the bot's own order and
+        is adopted (sync then protects any fill); if not, the setup may be placed again."""
+        s = self.setups[key]
+        o = self.ex.get_order_by_client_id(key)
+        if o is None:
+            s["status"] = "dropped"
             self._save_setups()
-            self._log("entry_adopted", o.product_id, order_id=o.order_id, client_order_id=key,
-                      status=o.status, filled_size=o.filled_size)
+            self._log("entry_intent_dropped", s["candidate"].get("product_id"), client_order_id=key)
+            return
+        recovered = o.order_id not in self.orders
         if recovered:
-            self._sync_orders({"entry"})
-            self._protect_grown(res)
-            for o in recovered:
-                self._alert("recovered entry", f"{o.product_id}: entry {o.client_order_id} was placed although "
-                                               f"the call failed; filled {o.filled_size} of {o.base_size}")
+            self._register(o.order_id, "entry", o.product_id, key, o.base_size,
+                           candidate=s["candidate"], limit=o.limit_price, placed_ts=s["ts"])
+        s["status"] = "placed"
+        self._save_setups()
+        self._log("entry_adopted", o.product_id, order_id=o.order_id, client_order_id=key,
+                  status=o.status, filled_size=o.filled_size)
+        if recovered:
+            self._alert("recovered entry", f"{o.product_id}: entry {key} was placed although the call "
+                                           f"failed; filled {o.filled_size} of {o.base_size}")
+
+    def _resolve_order(self, cid: str) -> None:
+        o = self.ex.get_order_by_client_id(cid)
+        if o is not None:
+            self._adopt_order(o, self.pending[cid])  # drop the intent only once the order is tracked
+        self.pending.pop(cid)
+        self._save_pending()
+
+    def _adopt_order(self, o, rec: dict) -> None:
+        """Track an exit or leg order the venue accepted although its placement call failed."""
+        pid, kind = rec["product_id"], rec["kind"]
+        if o.order_id in self.orders:
+            return
+        extra = {k: v for k, v in rec.items() if k not in ("kind", "product_id", "size")}
+        pos = self.pos.get(pid)
+        if kind in ("bracket", "stop") and pos is not None and o.status == "open" \
+                and not any(lg.order_id == o.order_id for lg in pos.legs):
+            pos.legs.append(Leg(o.order_id, o.base_size - o.filled_size, kind, o.stop_trigger))
+            self.store.save_position(pos)
+        self._register(o.order_id, kind, pid, o.client_order_id, rec["size"], **extra)
+        self._log("order_recovered", pid, order_id=o.order_id, client_order_id=o.client_order_id,
+                  kind=kind, status=o.status, filled_size=o.filled_size)
+        self._alert("recovered order", f"{pid}: {kind} {o.client_order_id} was placed although the call failed")
+
+    def _place_order(self, kind: str, pid: str, size: float, place, **extra) -> tuple[str, bool]:
+        """Place an exit or leg order with a fresh client id, recording the intent first. If the call
+        raises, the order is looked up by client id: found -> it is tracked as if placed; lookup also
+        failing -> the intent stays pending and is resolved by the next sync or fill poll.
+        Returns (order_id, recovered)."""
+        if any(r["product_id"] == pid for r in self.pending.values()):
+            raise ExchangeError(f"{pid}: an earlier order placement is unresolved")  # might hold the coins
+        cid = self._cid(pid, kind)
+        self.pending[cid] = {"kind": kind, "product_id": pid, "size": size, **extra}
+        self._save_pending()
+        try:
+            oid = place(cid)
+        except ExchangeError:
+            o = self.ex.get_order_by_client_id(cid)  # raising here leaves the intent pending
+            if o is None:
+                self.pending.pop(cid)
+                self._save_pending()
+                raise
+            self._adopt_order(o, self.pending[cid])
+            self.pending.pop(cid)
+            self._save_pending()
+            return o.order_id, True
+        self._register(oid, kind, pid, cid, size, **extra)
+        self.pending.pop(cid, None)
+        self._save_pending()
+        return oid, False
 
     def _entry_changed(self, oid: str, rec: dict) -> bool:
         o = self.ex.get_order(oid)
@@ -356,11 +448,8 @@ class Engine:
     def _reconcile(self, res: CycleResult) -> None:
         bal = self.ex.balances()
         for pid in list(self.pos):
-            try:
-                self._reconcile_one(self.pos[pid], bal)
-            except ExchangeError as e:  # one bad position must not stop the others being protected
-                res.errors.append(f"reconcile {pid}: {e}")
-                self._log("error", pid, where="reconcile", error=str(e))
+            if pid in self.pos:
+                self._guard(res, pid, "reconcile", lambda: self._reconcile_one(self.pos[pid], bal))
 
     def _reconcile_one(self, pos: Position, bal: dict[str, float]) -> None:
         pid = pos.product_id
@@ -392,16 +481,16 @@ class Engine:
 
     def _protect_all(self, res: CycleResult) -> None:
         status_alerts = self._meta("status_alerts", {})
+        def one(pid: str) -> None:
+            p = self._product(pid)
+            if p.status != "online" and status_alerts.get(pid) != p.status:
+                self._alert(f"{pid} is {p.status}", f"{pid} holds a position; entries stop, exits still tried")
+            status_alerts[pid] = p.status
+            self._protect_position(self.pos[pid])
+
         for pid in list(self.pos):
-            try:
-                p = self._product(pid)
-                if p.status != "online" and status_alerts.get(pid) != p.status:
-                    self._alert(f"{pid} is {p.status}", f"{pid} holds a position; entries stop, exits still tried")
-                status_alerts[pid] = p.status
-                self._protect_position(self.pos[pid])
-            except ExchangeError as e:
-                res.errors.append(f"protect {pid}: {e}")
-                self._alert("protection failed", f"{pid}: {e}")
+            if pid in self.pos:
+                self._guard(res, pid, "protect", lambda: one(pid), alert="protection failed")
         self._set_meta("status_alerts", {k: v for k, v in status_alerts.items() if k in self.pos})
 
     def _protect_position(self, pos: Position) -> None:
@@ -431,9 +520,7 @@ class Engine:
             self._alert("unprotected", f"{pid}: {size} is below the minimum order size")
             return
         limit = round_down(bid * FORCED_EXIT_PRICE, p.quote_increment)
-        cid = self._cid(pid, "ioc")
-        oid = self.ex.place_ioc_sell(pid, size, limit, cid)
-        self._register(oid, "ioc", pid, cid, size)
+        oid, _ = self._place_order("ioc", pid, size, lambda cid: self.ex.place_ioc_sell(pid, size, limit, cid))
         self._log("forced_exit", pid, order_id=oid, size=size, limit=limit, bid=bid, stop=pos.stop_price)
         self._alert("forced exit", f"{pid}: bid {bid} below stop {pos.stop_price}; IOC sell {size} at {limit}")
 
@@ -441,12 +528,58 @@ class Engine:
         for pid in sorted(self._grown):
             self._grown.discard(pid)
             if pid in self.pos:
-                try:
-                    self._protect(self.pos[pid])
-                except ExchangeError as e:
-                    self._alert("unprotected", f"{pid}: entry filled but protection failed: {e}")
-                    if res is not None:
-                        res.errors.append(f"protect {pid}: {e}")
+                self._guard(res, pid, "protect fill", lambda: self._protect(self.pos[pid]), alert="unprotected")
+
+    def _uncovered(self, pos: Position, open_ids: set[str]) -> bool:
+        """Legs missing or not summing to the position, with no exit IOC in flight to explain it."""
+        if self._ioc_in_flight(pos.product_id):
+            return False
+        need = round_down(pos.base_size, self._product(pos.product_id).base_increment)
+        covered = sum(leg.base_size for leg in pos.legs if leg.order_id in open_ids)
+        return any(leg.order_id not in open_ids for leg in pos.legs) or abs(covered - need) > _EPS
+
+    def _repair_coverage(self) -> None:
+        """Fill-poll repair of any uncovered position. Alerts once per uncovered episode."""
+        alerted = self._meta("uncovered_alerted", {})
+        open_ids: set[str] = set()
+        if not self._guard(None, None, "watch open orders",
+                           lambda: open_ids.update(o.order_id for o in self.ex.open_orders())):
+            return
+        for pid in list(self.pos):
+            pos = self.pos.get(pid)
+            ok = True
+            try:
+                bad = pos is not None and self._uncovered(pos, open_ids)
+            except Exception:
+                bad = True
+            if bad:
+                if pid not in alerted:
+                    self._alert("missing stop", f"{pid}: legs do not cover the position; re-placing")
+                    alerted[pid] = "missing stop"
+                ok = self._guard(None, pid, "watch protect", lambda: self._repair(self.pos[pid]))
+                if not ok and alerted.get(pid) != "unprotected":
+                    self._alert("unprotected", f"{pid}: could not re-place stops; retrying every poll")
+                    alerted[pid] = "unprotected"
+            if ok and not bad:
+                alerted.pop(pid, None)
+        self._set_meta("uncovered_alerted", {k: v for k, v in alerted.items() if k in self.pos})
+
+    def _repair(self, pos: Position) -> None:
+        pid = pos.product_id
+        self._sync_orders(None)  # an exit fill may explain the gap
+        if pid not in self.pos:
+            return
+        open_ids = {o.order_id for o in self.ex.open_orders()}
+        if not self._uncovered(pos, open_ids):
+            return
+        bid, _ = self.ex.bid_ask(pid)
+        covered = sum(leg.base_size for leg in pos.legs)
+        if bid < pos.stop_price:
+            self._forced_exit(pos, bid)
+        elif all(leg.order_id in open_ids for leg in pos.legs) and covered < pos.base_size:
+            self._cover_gap(pos)  # live legs stay; only the uncovered part gets a stop
+        else:
+            self._protect(pos)
 
     def _protect(self, pos: Position) -> None:
         """Cancel the position's legs and place fresh ones covering its full size."""
@@ -479,15 +612,18 @@ class Engine:
         p = self._product(pid)
         trigger = round_down(stop, p.quote_increment)
         limit = round_down(trigger * (1 - self.cfg.stop_limit_offset), p.quote_increment)
-        cid = self._cid(pid, kind)
-        if kind == "bracket":
-            target = round_down(pos.target_price, p.quote_increment)
-            oid = self.ex.place_bracket(pid, size, trigger, limit, target, cid)
-        else:
-            oid = self.ex.place_stop(pid, size, trigger, limit, cid)
-        pos.legs.append(Leg(oid, size, kind, trigger))
-        self.store.save_position(pos)
-        o = self._register(oid, kind, pid, cid, size)
+        target = round_down(pos.target_price, p.quote_increment)
+
+        def place(cid: str) -> str:
+            if kind == "bracket":
+                return self.ex.place_bracket(pid, size, trigger, limit, target, cid)
+            return self.ex.place_stop(pid, size, trigger, limit, cid)
+
+        oid, recovered = self._place_order(kind, pid, size, place)
+        if not any(leg.order_id == oid for leg in pos.legs):
+            pos.legs.append(Leg(oid, size, kind, trigger))
+            self.store.save_position(pos)
+        o = self.ex.get_order(oid)
         if o.status == "cancelled" or abs(o.base_size - size) > _EPS:
             raise ExchangeError(f"{kind} leg {oid} is not live")
 
@@ -514,13 +650,14 @@ class Engine:
     # ---------------------------------------------------------------- 4. trail
 
     def _trail_all(self, res: CycleResult) -> None:
+        def one(pid: str) -> None:
+            self._manage_target(self.pos[pid], res)
+            if pid in self.pos:
+                self._trail(self.pos[pid])
+
         for pid in list(self.pos):
-            try:
-                self._manage_target(self.pos[pid], res)
-                if pid in self.pos:
-                    self._trail(self.pos[pid])
-            except ExchangeError as e:
-                res.errors.append(f"trail {pid}: {e}")
+            if pid in self.pos:
+                self._guard(res, pid, "trail", lambda: one(pid), alert="protection failed")
 
     def _trail(self, pos: Position) -> None:
         pid, now = pos.product_id, self.now()
@@ -566,10 +703,10 @@ class Engine:
                                   sum(lg.base_size for lg in pos.legs)))
         if size >= p.min_base_size:
             limit = round_down(bid * TARGET_EXIT_PRICE, p.quote_increment)
-            cid = self._cid(pid, "ioc")
             try:
-                oid = self.ex.place_ioc_sell(pid, size, limit, cid)
-                self._register(oid, "ioc", pid, cid, size, purpose="target")
+                oid, _ = self._place_order("ioc", pid, size,
+                                           lambda cid: self.ex.place_ioc_sell(pid, size, limit, cid),
+                                           purpose="target")
                 self._log("target_exit", pid, order_id=oid, size=size, limit=limit, bid=bid,
                           target=pos.target_price)
             except ExchangeError as e:
@@ -585,20 +722,18 @@ class Engine:
             pos = self.pos.get(pid)
             if pos is None or self._ioc_in_flight(pid):
                 continue
-            try:
-                p = self._product(pid)
-                open_ids = {o.order_id for o in self.ex.open_orders()}
-                covered = sum(lg.base_size for lg in pos.legs if lg.order_id in open_ids)
-                gap = _sub(round_down(pos.base_size, p.base_increment), covered)
-                if gap >= p.min_base_size:
-                    self._place_leg(pos, "stop", gap, pos.stop_price)
-                elif gap > _EPS:
-                    self._alert("unprotected", f"{pid}: {gap} uncovered is below the minimum order size")
-            except ExchangeError as e:
-                self._alert("unprotected", f"{pid}: target IOC did not fill and the stop could not be "
-                                           f"re-placed: {e}")
-                if res is not None:
-                    res.errors.append(f"target {pid}: {e}")
+            self._guard(res, pid, "cover target", lambda: self._cover_gap(pos), alert="unprotected")
+
+    def _cover_gap(self, pos: Position) -> None:
+        pid = pos.product_id
+        p = self._product(pid)
+        open_ids = {o.order_id for o in self.ex.open_orders()}
+        covered = sum(lg.base_size for lg in pos.legs if lg.order_id in open_ids)
+        gap = _sub(round_down(pos.base_size, p.base_increment), covered)
+        if gap >= p.min_base_size:
+            self._place_leg(pos, "stop", gap, pos.stop_price)
+        elif gap > _EPS:
+            self._alert("unprotected", f"{pid}: {gap} uncovered is below the minimum order size")
 
     def _ioc_in_flight(self, pid: str) -> bool:
         return any(r["kind"] == "ioc" and r["product_id"] == pid for r in self.orders.values())
@@ -633,7 +768,9 @@ class Engine:
 
     # ---------------------------------------------------------------- 5-8. limits and entries
 
-    def _limits_and_entries(self, res: CycleResult) -> None:
+    def _limits_and_entries(self, res: CycleResult, entries_ok: bool = True) -> None:
+        """Limits, kill-switch cancel and entry expiry always run after a good sync; regime, scan
+        and new entries run only when no earlier step of this cycle failed."""
         equity = self.equity()
         if not math.isfinite(equity) or equity <= 0:
             res.errors.append("invalid equity")
@@ -657,6 +794,9 @@ class Engine:
         self._expire_entries(res)
         if not lim.can_enter:
             res.halted = lim.reason
+            return
+        if not entries_ok:
+            self._log("scan_skipped", None, reason="earlier step failed")
             return
         regime, day_mult = self._regime(equity, today)
         if regime == "risk_off":

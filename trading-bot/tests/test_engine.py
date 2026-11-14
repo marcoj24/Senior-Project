@@ -7,6 +7,7 @@ import pytest
 
 from bot.alerts import Alerts
 from bot.config import Config
+from bot.exchange.base import ExchangeError
 from bot.engine import Engine
 from bot.exchange.paper import PaperExchange
 from bot.models import Candle, Fees, Product
@@ -607,3 +608,195 @@ def test_withdrawal_is_not_counted_as_a_loss():
     assert st.day_start_equity == pytest.approx(700.0) and st.peak_equity == pytest.approx(700.0)
     w.cycle()  # applied once only
     assert w.store.load_risk_state().day_start_equity == pytest.approx(700.0)
+
+
+def fail_times(ex, method: str, n: int):
+    """Make `ex.<method>` raise ExchangeError on its next `n` calls (without performing them)."""
+    real = getattr(ex, method)
+    left = [n]
+
+    def wrapper(*args, **kwargs):
+        if left[0] > 0:
+            left[0] -= 1
+            raise ExchangeError(f"injected failure in {method}")
+        return real(*args, **kwargs)
+
+    setattr(ex, method, wrapper)
+
+
+def two_positions():
+    """SOL and AVAX entries both filled and protected."""
+    w = World(also=["AVAX-USD"])
+    assert sorted(w.cycle().entered) == ["AVAX-USD", "SOL-USD"]
+    w.bar(121.0)
+    w.watch()
+    return w
+
+
+def test_kill_switch_runs_despite_a_broken_position():
+    w = World(also=["AVAX-USD"])
+    w.cycle()
+    avax_entry = next(o for o in w.entries() if o.product_id == "AVAX-USD")
+    sol_entry = next(o for o in w.entries() if o.product_id == "SOL-USD")
+    w.ex.partial_fill(avax_entry.order_id, avax_entry.base_size, ENTRY, T0)
+    w.watch()
+    del w.ex._products["AVAX-USD"]  # every per-position step now fails for AVAX
+    w.edit_state(peak_equity=2000.0)
+    r = w.engine.run_cycle()
+    assert any("AVAX-USD" in e for e in r.errors)
+    assert r.halted == "kill switch triggered"
+    assert w.ex.get_order(sol_entry.order_id).status == "cancelled"
+
+
+def test_watch_retries_protection_after_a_failed_protect():
+    w = World()
+    w.cycle()
+    w.bar(121.0)
+    fail_times(w.ex, "place_stop", 2)  # bracket placed; the stop leg fails, and so does the in-poll retry
+    w.engine.watch_fills()
+    assert "unprotected" in w.titles()
+    assert w.sells() < w.position().base_size and w.engine.needs_watch()
+    w.watch()  # the next poll retries even though no entry changed
+    assert sorted(leg.kind for leg in w.position().legs) == ["bracket", "stop"]
+    assert not w.engine.needs_watch()
+
+
+def test_protect_failure_in_sync_does_not_block_other_positions():
+    w = World(also=["AVAX-USD"])
+    w.cycle()
+    entries = {o.product_id: o for o in w.entries()}
+    w.ex.partial_fill(entries["AVAX-USD"].order_id, entries["AVAX-USD"].base_size, ENTRY, T0)
+    w.watch()
+    avax = w.position("AVAX-USD")
+    w.ex.partial_fill(entries["SOL-USD"].order_id, entries["SOL-USD"].base_size, ENTRY, T0)  # not watched
+    w.ex.cancel(next(leg.order_id for leg in avax.legs if leg.kind == "bracket"))
+    w.ex.fail_next = "place_bracket"  # protecting SOL's new fill fails inside sync
+    r = w.engine.run_cycle()
+    assert any("SOL-USD" in e for e in r.errors)
+    assert w.sells("AVAX-USD") == pytest.approx(avax.base_size)  # AVAX still repaired this cycle
+    assert w.sells("SOL-USD") == pytest.approx(w.position("SOL-USD").base_size)  # and SOL retried
+
+
+def test_failed_trail_replacement_is_retried_by_watch():
+    w = World()
+    w.enter()
+    for close in (130.0, 140.0, 150.0, 158.0):
+        w.bar(close)
+        w.cycle()
+    assert w.position().half_taken
+    w.bar(175.0)
+    fail_times(w.ex, "place_stop", 2)  # both attempts of the trailed stop fail after the cancel
+    w.engine.run_cycle()
+    pos = w.position()
+    assert "unprotected" in w.titles() and w.sells() == 0 and w.engine.needs_watch()
+    w.watch()
+    assert w.sells() == pytest.approx(pos.base_size) and w.position().stop_price == pytest.approx(pos.stop_price)
+
+
+def test_unresolvable_intent_does_not_block_fill_protection():
+    w = World()
+    w.cycle()
+    setups = json.loads(w.store.get_meta("setups"))
+    setups["ETH-USD-1"] = {"status": "placing", "ts": T0, "candidate": {"product_id": "ETH-USD"}}
+    w.store.set_meta("setups", json.dumps(setups))
+    fail_times(w.ex, "get_order_by_client_id", 1000)
+    w.bar(121.0)
+    w.watch()  # the SOL fill is still accounted and protected
+    assert w.position() is not None
+    r = w.cycle()
+    assert r.errors and r.entered == []
+    assert json.loads(w.store.get_meta("setups"))["ETH-USD-1"]["status"] == "placing"
+
+
+def gap_below_stop(w):
+    w.cycle()
+    w.bar(90.0, low=88.0, high=92.0, open_=90.0)
+
+
+def test_lost_reply_forced_exit_is_recorded():
+    w = World()
+    w.enter()
+    gap_below_stop(w)
+    w.ex.fail_after_next = "place_ioc_sell"
+    w.cycle()
+    [ioc] = [o for o in w.ex.open_orders() if o.kind == "ioc"]
+    assert len([o for o in w.ex._orders.values() if o.kind == "ioc"]) == 1
+    w.bar(89.0, low=87.0, high=91.0, open_=90.0)
+    r = w.cycle()
+    assert r.exited == ["SOL-USD"]
+    [closed] = w.store.journal_rows("trade_closed")
+    assert closed["data"]["pnl_usd"] < 0 and w.store.load_risk_state().consecutive_losses == 1
+
+
+def test_lost_reply_target_ioc_is_recorded():
+    w = World(brackets=False)
+    pos = w.enter()
+    for close in (130.0, 140.0, 150.0):
+        w.bar(close)
+        w.cycle()
+    w.bar(160.0)
+    w.ex.fail_after_next = "place_ioc_sell"
+    w.cycle()
+    assert len([o for o in w.ex._orders.values() if o.kind == "ioc"]) == 1
+    w.bar(161.0)
+    w.cycle()
+    after = w.position()
+    a = round_down(pos.base_size / 2, 0.001)
+    assert after.half_taken and after.base_size == pytest.approx(pos.base_size - a)
+    trades = json.loads(w.store.get_meta("trades"))
+    assert trades["SOL-USD"]["exits"][0]["size"] == pytest.approx(a)
+
+
+def test_lost_reply_on_leg_placement_makes_no_duplicate():
+    w = World()
+    w.cycle()
+    w.bar(121.0)
+    w.ex.fail_after_next = "place_stop"  # found again by client id at once
+    w.watch()
+    assert sorted(leg.kind for leg in w.position().legs) == ["bracket", "stop"]
+    assert len([o for o in w.ex._orders.values() if o.kind != "entry"]) == 2
+
+    w = World()
+    w.cycle()
+    w.bar(121.0)
+    w.ex.fail_after_next = "place_bracket"
+    fail_times(w.ex, "get_order_by_client_id", 1)  # and the lookup fails too: resolved on the next poll
+    w.engine.watch_fills()
+    assert w.engine.needs_watch()
+    w.watch()
+    assert sorted(leg.kind for leg in w.position().legs) == ["bracket", "stop"]
+    assert len([o for o in w.ex._orders.values() if o.kind != "entry"]) == 2
+
+
+def test_needs_watch():
+    w = World()
+    assert not w.engine.needs_watch()
+    w.cycle()
+    assert w.engine.needs_watch()  # an entry rests
+    w.bar(121.0)
+    w.watch()
+    assert not w.engine.needs_watch()  # filled and covered
+    w.ex.cancel(w.position().legs[0].order_id)
+    assert w.engine.needs_watch()  # uncovered
+    w2 = World()
+    w2.ex.fail_after_next = "place_entry"
+    w2.cycle()
+    fail_times(w2.ex, "get_order_by_client_id", 1)
+    w2.engine.watch_fills()
+    assert w2.engine.needs_watch()  # an intent is unresolved
+
+
+def test_malformed_position_does_not_escape():
+    w = two_positions()
+    row = w.store._db.execute("SELECT data FROM positions WHERE product_id = 'AVAX-USD'").fetchone()
+    d = json.loads(row[0])
+    d["base_size"] = "oops"
+    with w.store._db:
+        w.store._db.execute("UPDATE positions SET data = ? WHERE product_id = 'AVAX-USD'", (json.dumps(d),))
+    sol = w.position("SOL-USD")
+    w.ex.cancel(next(leg.order_id for leg in sol.legs if leg.kind == "bracket"))
+    r = w.engine.run_cycle()  # does not raise
+    assert r.errors and "engine error" in w.titles()
+    assert w.sells("SOL-USD") == pytest.approx(sol.base_size)  # SOL still repaired
+    w.engine.watch_fills()  # does not raise
+    assert w.engine.needs_watch() in (True, False)
