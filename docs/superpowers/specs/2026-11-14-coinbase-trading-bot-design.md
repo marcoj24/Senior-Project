@@ -138,12 +138,15 @@ exit on the stop, spread, slippage allowance). A trade is allowed only if:
 
 - the losing round-trip cost is at most 20% of the stop distance, and
 - reward-to-risk **after costs** — (target distance − winning cost) ÷
-  (stop distance + losing cost) — is at least 1.8.
+  (stop distance + losing cost) — is at least 1.5.
 
-At the lowest fee tier this forces stops of roughly 8% or wider, which means
-fewer, longer trades. That is intended: with a 6% stop the strategy would need
-to win about 42% of the time just to break even, which trend-following rarely
-does. The gate loosens by itself as the fee tier improves.
+Worked at the lowest fee tier (0.6% maker, 1.2% taker, 0.1% spread, 0.1%
+slippage): winning cost 1.3%, losing cost 2.0%. The 20% rule then needs a stop
+of at least 10%, and a 10% stop with a 2R target gives 1.56 after costs, which
+passes. So at base fees the bot only takes trades with 10–15% stops: few,
+long trades needing roughly 39% winners to break even. (A floor of 1.8 was
+first written here; it is unreachable with a 2R target at these fees and was
+corrected to 1.5.) The gate loosens by itself as the fee tier improves.
 
 **Targets and exits (builder's call):** the first target is 2 × the stop
 distance (2R); the cost gate is measured against it. At the first target half
@@ -157,12 +160,13 @@ after a set time; the bot does not chase.
 
 **Order mechanics.** On spot, coins held by one resting sell order cannot back
 a second one, so a separate stop and target cannot both rest on the same
-coins. The bot uses Coinbase's bracket order (stop and target in one order),
-attached to the entry where the API allows, so protection exists the moment
-the entry fills. If bracket orders prove unavailable, the fallback is: the
-stop rests on the exchange, the target is managed by the bot, and while an
-entry order is open the bot polls for the fill every few seconds and places
-the stop immediately.
+coins. The position is therefore protected in two legs: half the coins sit
+under a Coinbase bracket order (stop and 2R target in one order) and the other
+half under a plain stop that trails. While an entry order is open the bot
+polls for the fill every few seconds and places both legs at once, so the
+unprotected window is seconds, not a cycle. If bracket orders prove
+unavailable, both halves get plain stops and the bot manages the target
+itself.
 
 A stop-limit can be jumped in a gap and left unfilled. The stop's limit price
 is set well below its trigger (default 5%), and if a cycle finds price below
@@ -373,10 +377,10 @@ folded into the sections above.
 
 | # | Weakness found | Severity | Correction |
 |---|---|---|---|
-| 1 | Fees made the original strategy need ~42% winners to break even | Critical | Cost gate now caps cost at 20% of stop distance and tests reward-to-risk after costs; wider stops, fewer trades |
+| 1 | Fees made the original strategy need ~42% winners to break even | Critical | Cost gate now caps cost at 20% of stop distance and requires reward-to-risk of 1.5 after costs; stops of 10–15% at base fees, fewer trades |
 | 2 | Post-only orders on breakouts fill mostly on failed breakouts | Critical | Enter on the retest, not the breakout candle |
 | 3 | Stop and target cannot both rest on the same spot coins | Critical | Bracket orders, with a defined fallback |
-| 4 | Up to 15 minutes unprotected between entry fill and stop | High | Stop attached to entry, or fast fill polling |
+| 4 | Up to 15 minutes unprotected between entry fill and stop | High | Fill polling every few seconds while an entry is open |
 | 5 | Stop-limit can be jumped in a gap | High | Wide limit offset plus forced exit and alert |
 | 6 | Risk per trade ignored fees and slippage (real loss ~30% larger) | High | Risk now includes them |
 | 7 | Several positions stopping together could lose far more than 6% | High | 8% cap on total open risk; altcoins treated as one group outside risk-on |
