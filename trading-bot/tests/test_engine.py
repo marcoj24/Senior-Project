@@ -333,12 +333,16 @@ def test_owner_sold_by_hand_is_reconciled():
     old_legs = [leg.order_id for leg in pos.legs]
     half = round(pos.base_size / 2, 3)
     w.ex._coins["SOL"] = half  # the owner sold half on the website
-    w.cycle()
+    w.engine.run_cycle()  # first sighting: nothing is touched
+    assert w.position().base_size == pytest.approx(pos.base_size)
+    assert all(w.ex.get_order(i).status == "open" for i in old_legs)
+    w.cycle()  # the same shortfall on a second quiet cycle: reconciled
     assert w.position().base_size == pytest.approx(half)
     assert all(w.ex.get_order(i).status == "cancelled" for i in old_legs)
     assert w.sells() == pytest.approx(half)  # the rest is re-protected
 
     w.ex._coins["SOL"] = 0.0  # and then the rest
+    w.engine.run_cycle()
     w.cycle()
     assert w.position() is None
     assert [o for o in w.ex.open_orders() if o.product_id == "SOL-USD"] == []
@@ -1051,6 +1055,7 @@ def test_episodes_cleared_when_a_position_is_deleted():
     w.ex.cancel(order.order_id)
     w.ex._coins["SOL"] = 0.0  # the owner sold the dust
     w.engine.run_cycle()
+    w.engine.run_cycle()  # confirmed on the second quiet cycle
     assert w.position() is None
     assert not any(k.endswith("|SOL-USD") for k in json.loads(w.store.get_meta("episodes")))
 
@@ -1379,12 +1384,15 @@ def check_invariants(w, closes, synced, pid="SOL-USD"):
     where = f"qty {qty} sells {sells} pos {pos}"
     # 2. open sells never exceed the bot's position, although the account holds far more coins
     assert sells <= qty + 1e-9, where
-    assert w.ex.balances().get("SOL", 0.0) == pytest.approx(OWNER_SOL + qty, abs=1e-9), where  # owner's untouched
+    late = sum(size for _, size, _ in w.ex._uncredited)  # bought, not yet credited to the balance
+    assert w.ex._coins.get("SOL", 0.0) == pytest.approx(OWNER_SOL + qty - late, abs=1e-9), where  # owner's untouched
     # the stored position is the order-status quantity, whatever fills() has or has not reported
     if synced:
         assert (pos.base_size if pos else 0.0) == pytest.approx(qty, abs=1e-9), where
     # 1. the coins are covered, or dust, or a forced exit is retrying with the bid below the stop
     need = round_down(qty + 1e-9, 0.001)
+    if late > 0:
+        return False  # the venue rejects stops for coins it has not credited; the poll retries
     if need >= 0.01 and abs(sells - need) > 1e-9:
         episodes = json.loads(w.store.get_meta("episodes") or "{}")
         assert pos is not None and w.ex.bid_ask(pid)[0] < pos.stop_price and f"forced|{pid}" in episodes, where
@@ -1428,6 +1436,8 @@ def random_venue_event(w, rng):
         w.ex.fill_size_factor = rng.choice([1.0, 0.9997, 0.8])
     elif r < 0.84:
         w.ex.report_avg_price = not w.ex.report_avg_price
+    elif r < 0.90:  # the balance starts (or stops) lagging entry fills
+        w.ex.credit_lag = 0 if w.ex.credit_lag else 3
 
 
 def random_run(seed, closes, episodes=12, steps_each=40):
@@ -1465,6 +1475,9 @@ def random_run(seed, closes, episodes=12, steps_each=40):
             stats["lagged"] += w.ex.hold_fills
             stats["fired"] += fired
             stats["steps"] += 1
+        w.ex.credit_lag = 0
+        while w.ex._uncredited:
+            w.ex.balances()
         # settle: fills catch up (or the bounded wait runs out) and every flat trade has closed once
         w.ex.release_fills()
         w.ex.hold_fills = False
@@ -1563,3 +1576,57 @@ def test_open_shadow_is_resolved_by_later_hourly_candles():
     w.cycle()
     assert w.store.open_shadows() == []
     assert w.store.closed_shadows()[0]["r_multiple"] == -1.0
+
+
+def test_balance_lagging_an_entry_fill_writes_nothing_off():
+    w = World()
+    w.cycle()
+    [order] = w.entries()
+    w.ex.credit_lag = 200  # the fill is in order status at once; the coins are credited much later
+    w.bar(121.0)
+    for _ in range(3):
+        w.engine.watch_fills()  # the venue rejects the stops: coins not credited yet
+    w.engine.run_cycle()  # reconcile sees balance < position: a sighting only, and the fill is recent
+    for _ in range(3):
+        w.engine.watch_fills()
+    pos = w.position()
+    assert pos.base_size == pytest.approx(order.base_size) and w.sells() == 0
+    assert w.ex._uncredited and w.ex.balances().get("SOL", 0.0) == 0.0
+    assert w.store.journal_rows("reconcile") == [] and not any("reconcil" in t for t in w.titles())
+    assert json.loads(w.store.get_meta("trades"))["SOL-USD"]["written_off"] == 0.0
+    assert w.engine.needs_watch()
+    while w.ex._uncredited:
+        w.ex.balances()  # the coins land
+    w.watch()  # the ordinary poll repair places the stops; check_covered: position == balance == sells
+    assert w.position().base_size == pytest.approx(order.base_size)
+    w.cycle()
+    assert w.store.journal_rows("reconcile") == [] and json.loads(w.store.get_meta("shortfall")) == {}
+
+
+def test_shortfall_needs_two_consecutive_quiet_cycles():
+    w = World()
+    pos = w.enter()
+    w.engine.run_cycle()
+    w.ex._coins["SOL"] = 1.0
+    w.engine.run_cycle()  # sighting
+    w.ex._coins["SOL"] = pos.base_size  # it was only a lag
+    w.cycle()
+    w.ex._coins["SOL"] = 1.0
+    w.engine.run_cycle()  # a new first sighting, not a confirmation
+    assert w.position().base_size == pytest.approx(pos.base_size) and w.store.journal_rows("reconcile") == []
+    w.cycle()
+    assert w.position().base_size == pytest.approx(1.0) and w.sells() == pytest.approx(1.0)
+
+
+def test_bracket_with_no_fills_and_no_average_still_takes_half():
+    w = World(cfg=Config(fill_wait_cycles=1))
+    pos = w.enter()
+    w.cycle()
+    w.ex.hold_fills = True
+    w.ex.report_avg_price = False
+    for close in (130.0, 140.0, 150.0, 158.0):  # the bracket's target fills; no price is ever reported
+        w.bar(close)
+        w.cycle()
+    w.cycle()
+    after = w.position()
+    assert after.base_size < pos.base_size and after.half_taken and after.stop_price >= ENTRY

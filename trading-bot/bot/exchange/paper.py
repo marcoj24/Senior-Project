@@ -59,6 +59,8 @@ class PaperExchange:
         self.fill_size_factor = 1.0  # fills() reports each size times this (sizes not summing to filled_size)
         self.report_avg_price = True  # False: orders carry no average fill price
         self._held_fills: list[Fill] = []
+        self.credit_lag = 0  # an entry fill's coins reach balances() only after this many balances() calls
+        self._uncredited: list[list] = []  # [base, size, balances() calls left]
         self._cash = cash
         self._coins: dict[str, float] = {}
         self._fees = fees
@@ -146,6 +148,11 @@ class PaperExchange:
 
     def balances(self) -> dict[str, float]:
         self._maybe_fail("balances")
+        for item in list(self._uncredited):
+            item[2] -= 1
+            if item[2] < 0:
+                self._uncredited.remove(item)
+                self._coins[item[0]] = self._coins.get(item[0], 0.0) + item[1]
         return {"USD": self._cash, **self._coins}
 
     def place_entry(self, product_id: str, base_size: float, limit_price: float, client_order_id: str) -> str:
@@ -287,7 +294,10 @@ class PaperExchange:
         if o.kind == "entry":
             side = "buy"
             self._cash -= price * size + fee
-            self._coins[base] = self._coins.get(base, 0.0) + size
+            if self.credit_lag > 0:  # order status is ahead of the balance
+                self._uncredited.append([base, size, self.credit_lag])
+            else:
+                self._coins[base] = self._coins.get(base, 0.0) + size
         else:
             side = "sell"
             self._cash += price * size - fee

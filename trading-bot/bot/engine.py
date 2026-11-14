@@ -96,6 +96,8 @@ class Engine:
             del self.trades[pid]  # interrupted between the two saves: it is closing
         self.cycle_no: int = self._meta("cycle_no", 0)
         self._qty_events = 0  # counts quantity changes seen in order status (reconcile's snapshot check)
+        self.qty_cycle: dict[str, int] = self._meta("qty_cycle", {})  # product -> cycle of its last fill
+        self.shortfall: dict[str, dict] = self._meta("shortfall", {})  # balance-below-position sightings
         self.setups: dict[str, dict] = self._meta("setups", {})
         self.pending: dict[str, dict] = self._meta("pending", {})  # exit/leg placements not yet registered
         self.episodes: dict[str, dict] = self._meta("episodes", {})  # alert-once state, by episode key
@@ -533,6 +535,9 @@ class Engine:
             rec["final_cycle"] = self.cycle_no
         if delta:
             self._qty_events += 1
+            if self.qty_cycle.get(pid) != self.cycle_no:
+                self.qty_cycle[pid] = self.cycle_no
+                self._set_meta("qty_cycle", self.qty_cycle)
             if rec["kind"] == "entry":
                 self._link_entry(oid, rec)
         t = self._trade_of(rec)
@@ -581,6 +586,10 @@ class Engine:
         avg, target = rec.get("avg_price"), rec.get("target")
         if avg and target:
             return "target" if avg >= target * (1 - 1e-9) else "stop"
+        if rec.get("given_up"):  # no price will come: the side the market is on decides
+            bid, stop = self.last_bid.get(rec["product_id"]), rec.get("trigger")
+            if bid is not None and target and stop:
+                return "target" if bid >= (stop + target) / 2 else "stop"
         return "bracket"  # which side filled is not known until a price arrives
 
     def _record_exit(self, oid: str, rec: dict, t: dict, last: bool) -> None:
@@ -682,6 +691,9 @@ class Engine:
             if rec["final"] and ledger.needs_fills(rec) \
                     and self.cycle_no - rec.get("final_cycle", self.cycle_no) >= self.cfg.fill_wait_cycles:
                 rec["given_up"] = changed = True
+                t = self._trade_of(rec)
+                if ledger.is_exit(rec) and t is not None:
+                    self._record_exit(oid, rec, t, last=False)  # settles a bracket's target-or-stop
                 self._log("fills_missing", rec["product_id"], order_id=oid, kind=rec["kind"],
                           filled=rec["filled"], fills_size=rec["acc_size"], price=ledger.price_of(rec)[0])
         if changed:
@@ -756,8 +768,25 @@ class Engine:
         sold coins by hand: the position shrinks. A balance above it is never adopted."""
         pid = pos.product_id
         p = self._product(pid)
-        if _held(bal, p) >= round_down(pos.base_size, p.base_increment) - _EPS:
+        held = _held(bal, p)
+        if held >= round_down(pos.base_size, p.base_increment) - _EPS:
+            if self.shortfall.pop(pid, None) is not None:
+                self._set_meta("shortfall", self.shortfall)
             return
+        # Order status can run ahead of the balance (coins just bought are not credited yet), so a
+        # first sighting changes nothing. Act only on the same shortfall seen on two consecutive
+        # cycles with no fill of this product in this cycle or the one before.
+        seen = self.shortfall.get(pid)
+        quiet = self.cycle_no - self.qty_cycle.get(pid, self.cycle_no - 2) >= 2
+        confirmed = (seen is not None and seen["cycle"] == self.cycle_no - 1
+                     and abs(seen["held"] - held) <= _EPS and abs(seen["size"] - pos.base_size) <= _EPS)
+        if not (quiet and confirmed):
+            self.shortfall[pid] = {"cycle": self.cycle_no, "held": held, "size": pos.base_size}
+            self._set_meta("shortfall", self.shortfall)
+            self._log("reconcile_sighting", pid, position_size=pos.base_size, balance=held, quiet=quiet)
+            return
+        del self.shortfall[pid]
+        self._set_meta("shortfall", self.shortfall)
         self._cancel_legs(pos)
         if self.pos.get(pid) is not pos:
             return  # a leg had filled; order status closed the position
