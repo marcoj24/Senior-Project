@@ -1630,3 +1630,16 @@ def test_bracket_with_no_fills_and_no_average_still_takes_half():
     w.cycle()
     after = w.position()
     assert after.base_size < pos.base_size and after.half_taken and after.stop_price >= ENTRY
+
+
+def test_engine_tells_the_venue_about_recent_quantity_changes():
+    w = World()
+    hints = []
+    w.ex.hint_quantity_change = hints.append
+    w.cycle()
+    w.bar(121.0)
+    w.watch()  # the entry fill is noticed: qty_cycle = this cycle
+    w.cycle()  # next cycle: still recent
+    w.cycle()
+    w.cycle()
+    assert hints[0] is False and True in hints

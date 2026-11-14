@@ -93,10 +93,10 @@ def keys(env: Env) -> tuple[str, str, str | None]:
 
 def load(args, env: Env) -> Config:
     load_dotenv(".env", env.environ)
-    cfg = load_config(args.config)
-    if cfg.mode not in ("paper", "live"):
-        raise Exit(2, f"mode must be exactly 'paper' or 'live', not {cfg.mode!r}")
-    return cfg
+    try:
+        return load_config(args.config)
+    except ValueError as e:
+        raise Exit(2, f"invalid config: {e}") from None
 
 
 def build_engine(cfg: Config, venue, store: Store, env: Env, alerts: Alerts, with_llm: bool) -> Engine:

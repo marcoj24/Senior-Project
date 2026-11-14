@@ -582,13 +582,55 @@ def test_transfers_inferred_from_unexplained_usd_change():
     assert ex.transfers(0) == []  # first call sets the baseline
     clock["t"] += 900
     usd["v"] = "35"  # +10 deposit
-    got = ex.transfers(0)
-    assert [(t.ts, t.amount_usd) for t in got] == [(NOW + 900, 10.0)]
+    assert ex.transfers(0) == []  # first sighting only
+    clock["t"] += 900
+    got = ex.transfers(0)  # the same amount on a second consecutive call: a real deposit
+    assert [(t.ts, t.amount_usd) for t in got] == [(NOW + 1800, 10.0)]
     clock["t"] += 900
     usd["v"] = "24.75"  # bought 0.1 @ 100 + 0.25 fee: explained, not a transfer
-    fills["list"] = [fill("e", "BUY", "100", "0.1", "0.25", "2023-11-15T00:20:00Z")]
-    assert [(t.ts, t.amount_usd) for t in ex.transfers(0)] == [(NOW + 900, 10.0)]
-    assert ex.transfers(NOW + 901) == []
+    fills["list"] = [fill("e", "BUY", "100", "0.1", "0.25", "2023-11-15T00:40:00Z")]
+    assert [(t.ts, t.amount_usd) for t in ex.transfers(0)] == [(NOW + 1800, 10.0)]
+    assert ex.transfers(NOW + 1801) == []
+
+
+def _transfer_exchange(usd, fills):
+    accounts = lambda **kw: ListAccountsResponse({"accounts": [  # noqa: E731
+        {"currency": "USD", "available_balance": {"value": usd["v"]}, "hold": {"value": "0"}}], "has_next": False})
+    c = FakeClient(get_accounts=accounts, get_public_products=products_resp(product()),
+                   get_fills=lambda **kw: ListFillsResponse({"fills": list(fills["list"]), "cursor": ""}))
+    clock = {"t": NOW}
+    return CoinbaseExchange(KEY, SECRET, "pf-1", client=c, now=lambda: clock["t"]), clock
+
+
+def test_a_late_fill_is_never_booked_as_a_transfer():
+    usd, fills = {"v": "100"}, {"list": []}
+    ex, clock = _transfer_exchange(usd, fills)
+    ex.transfers(0)
+    clock["t"] += 900
+    usd["v"] = "50"  # entry fill spent 50 but fills() has not listed it yet
+    ex.hint_quantity_change(True)  # the engine saw the order status change
+    assert ex.transfers(0) == []
+    clock["t"] += 900
+    assert ex.transfers(0) == []  # without the hint: first sighting only
+    clock["t"] += 900
+    fills["list"] = [fill("e", "BUY", "100", "0.5", "0", "2023-11-15T00:20:00Z")]  # the fill appears
+    assert ex.transfers(0) == []
+    clock["t"] += 900
+    assert ex.transfers(0) == []
+
+
+def test_a_deposit_seen_on_two_quiet_calls_is_emitted_once():
+    usd, fills = {"v": "25"}, {"list": []}
+    ex, clock = _transfer_exchange(usd, fills)
+    ex.transfers(0)
+    usd["v"] = "75"
+    for _ in range(2):
+        clock["t"] += 900
+        ex.hint_quantity_change(False)
+        got = ex.transfers(0)
+    assert [t.amount_usd for t in got] == [50.0]
+    clock["t"] += 900
+    assert [t.amount_usd for t in ex.transfers(0)] == [50.0]
 
 
 def test_transfers_wait_while_a_fill_is_settling():

@@ -144,6 +144,13 @@ class CoinbaseExchange:
         self._exit_kinds: dict[str, tuple[str, float | None]] = {}
         self._usd_base: tuple[int, float] | None = None
         self._transfers: list[Transfer] = []
+        self._pending_transfer: float | None = None  # unexplained amount seen once, awaiting confirmation
+        self._qty_recent = False
+
+    def hint_quantity_change(self, recent: bool) -> None:
+        """The engine says an order-status quantity change happened this cycle or the one before; fills may
+        lag it, so transfer inference pauses."""
+        self._qty_recent = recent
 
     def __repr__(self) -> str:
         return f"CoinbaseExchange(portfolio_id={self._portfolio!r}, authenticated={self._authenticated})"
@@ -485,6 +492,8 @@ class CoinbaseExchange:
         usd = self.balances().get("USD", 0.0)
         if self._usd_base is None:
             self._usd_base = (now, usd)
+        elif self._qty_recent:
+            self._pending_transfer = None  # fills may lag order status: infer nothing, keep the base
         else:
             base_ts, base_usd = self._usd_base
             new = [f for f in self.fills(base_ts) if f.ts > base_ts]
@@ -495,9 +504,16 @@ class CoinbaseExchange:
                         value = f.price * f.base_size
                         flow += (value if f.side == "sell" else -value) - f.fee
                 unexplained = (usd - base_usd) - flow
-                if abs(unexplained) >= TRANSFER_TOLERANCE_USD:
+                if abs(unexplained) < TRANSFER_TOLERANCE_USD:
+                    self._pending_transfer = None
+                    self._usd_base = (now, usd)
+                elif self._pending_transfer is not None and abs(unexplained - self._pending_transfer) <= 0.01:
+                    # the same amount on two consecutive quiet calls: a real deposit or withdrawal
                     self._transfers.append(Transfer(now, round(unexplained, 8)))
-                self._usd_base = (now, usd)
+                    self._pending_transfer = None
+                    self._usd_base = (now, usd)
+                else:
+                    self._pending_transfer = unexplained  # first sighting; the base stays put
         return [t for t in self._transfers if t.ts >= since_ts]
 
 

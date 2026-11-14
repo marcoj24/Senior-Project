@@ -42,3 +42,31 @@ def test_example_file_lists_every_setting_at_its_default():
     path = Path(__file__).resolve().parent.parent / "config.example.yaml"
     assert set(yaml.safe_load(path.read_text())) == {f.name for f in fields(Config)}
     assert load_config(str(path)) == Config()
+
+
+from bot.config import validate_config
+
+
+@pytest.mark.parametrize("field,value", [
+    ("kill_drawdown", 25), ("daily_loss_halt", 6), ("max_open_risk", 8), ("streak_factor", 1.5),
+    ("risk_per_trade", 0.5), ("mode", "Live"), ("stop_min", 0.2), ("slippage", 0.5),
+    ("cycle_minutes", 0), ("tiers", []), ("tiers", [(100, 0)]), ("target_r", -1),
+])
+def test_validate_rejects_bad_values(field, value):
+    c = Config()
+    setattr(c, field, value)
+    with pytest.raises(ValueError, match=field):
+        validate_config(c)
+
+
+def test_load_config_rejects_percent_style(tmp_path):
+    p = tmp_path / "c.yaml"
+    for line in ("kill_drawdown: 25", "daily_loss_halt: 6", "max_open_risk: 8", "streak_factor: 2"):
+        p.write_text(line + "\n")
+        with pytest.raises(ValueError, match=line.split(":")[0]):
+            load_config(str(p))
+
+
+def test_defaults_and_example_pass(tmp_path):
+    validate_config(Config())
+    load_config("config.example.yaml")

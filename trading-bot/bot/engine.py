@@ -356,6 +356,9 @@ class Engine:
         if self.state is None:
             return
         cur = self._meta("transfer_cursor", {"ts": self.now(), "seen": []})
+        hint = getattr(self.ex, "hint_quantity_change", None)
+        if hint:  # same two-cycle window as the reconcile fix's "quiet" test
+            hint(any(self.cycle_no - c < 2 for c in self.qty_cycle.values()))
         seen = Counter(cur["seen"])
         got = sorted(self.ex.transfers(cur["ts"]), key=lambda t: t.ts)
         for t in got:
