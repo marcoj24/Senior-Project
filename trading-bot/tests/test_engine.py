@@ -82,16 +82,20 @@ class FakeLLM:
 class World:
     """SOL-USD and BTC-USD on a paper venue, an engine wired to it, and a clock at T0."""
 
-    def __init__(self, entry=("approve", 1.0), regime_mult=1.0, btc_step=1.0, cfg=None):
+    def __init__(self, entry=("approve", 1.0), regime_mult=1.0, btc_step=1.0, cfg=None, brackets=True,
+                 also=()):
         self.cfg = cfg or Config()
-        self.ex = PaperExchange(1000.0, FEES, [product("SOL-USD"), product("BTC-USD")])
-        for c in daily(50.0, 0.3):
-            self.ex.feed("SOL-USD", D1, c, fills=False)
+        self.alts = ["SOL-USD", *also]  # alts all share SOL's history
+        self.ex = PaperExchange(1000.0, FEES, [product(p) for p in self.alts] + [product("BTC-USD")], brackets)
+        for pid in self.alts:
+            for c in daily(50.0, 0.3):
+                self.ex.feed(pid, D1, c, fills=False)
         for c in daily(1000.0, btc_step):
             self.ex.feed("BTC-USD", D1, c, fills=False)
         self.c4h = setup_4h()
-        for c in self.c4h:
-            self.ex.feed("SOL-USD", H4, c)
+        for pid in self.alts:
+            for c in self.c4h:
+                self.ex.feed(pid, H4, c)
         self.clock = Clock(T0)
         self.llm = FakeLLM(entry, regime_mult)
         self.alerts = Alerts()
@@ -103,13 +107,14 @@ class World:
         return Engine(self.cfg, self.ex, store, reviewer, self.alerts, self.clock)
 
     def bar(self, close, low=None, high=None, open_=None):
-        """Feed the next 4h SOL candle (fills on) and move the clock to its close."""
+        """Feed the next 4h candle to every alt (fills on) and move the clock to its close."""
         o = self.c4h[-1].close if open_ is None else open_
         ts = self.c4h[-1].ts + H4
         c = Candle(ts, o, high if high is not None else max(o, close) + S,
                    low if low is not None else min(o, close) - S, close, 1000.0)
         self.c4h.append(c)
-        self.ex.feed("SOL-USD", H4, c)
+        for pid in self.alts:
+            self.ex.feed(pid, H4, c)
         self.clock.t = ts + H4
 
     def cycle(self):
@@ -123,10 +128,11 @@ class World:
 
     def check_covered(self):
         """Whenever the bot holds coins, open sell orders cover exactly the bot's position."""
-        held = sum(p.base_size for p in self.store.positions())
-        coins = self.ex.balances().get("SOL", 0.0)
-        assert held == pytest.approx(coins, abs=1e-9)
-        assert self.sells() == pytest.approx(coins, abs=1e-9)
+        for pid in self.alts:
+            held = sum(p.base_size for p in self.store.positions() if p.product_id == pid)
+            coins = self.ex.balances().get(pid.split("-")[0], 0.0)
+            assert held == pytest.approx(coins, abs=1e-9)
+            assert self.sells(pid) == pytest.approx(coins, abs=1e-9)
 
     def sells(self, pid="SOL-USD"):
         return sum(o.base_size - o.filled_size for o in self.ex.open_orders()
@@ -187,6 +193,8 @@ def test_full_trade_lifecycle():
     assert pos.half_taken
     assert pos.base_size == pytest.approx(size - round_down(size / 2, 0.001))  # the bracket half sold
     assert pos.stop_price >= ENTRY  # break-even, then trailed
+    moves = [r["data"] for r in w.store.journal_rows("stop_moved")]
+    assert moves[0]["why"] == "break-even" and moves[0]["new_stop"] == pytest.approx(ENTRY)
     for close in (168.0, 178.0, 188.0):
         w.bar(close)
         w.cycle()
@@ -358,6 +366,34 @@ def test_exchange_error_mid_cycle_is_safe():
     assert not w.cycle().errors
 
 
+def test_lost_reply_after_entry_is_adopted_once():
+    w = World()
+    w.ex.fail_next = "get_order"  # the entry reached the exchange but its verification failed
+    assert w.cycle().errors
+    [order] = w.entries()
+    r = w.cycle()
+    assert r.entered == [] and len(w.entries()) == 1
+    w.bar(121.0)
+    w.watch()
+    assert w.position().base_size == pytest.approx(order.base_size)  # counted once
+    w.cycle()
+    assert w.position().base_size == pytest.approx(order.base_size)
+
+
+def test_one_broken_position_does_not_block_protecting_the_others():
+    w = World(also=["AVAX-USD"])
+    assert sorted(w.cycle().entered) == ["AVAX-USD", "SOL-USD"]
+    w.bar(121.0)
+    w.watch()
+    avax = w.position("AVAX-USD")
+    del w.ex._products["SOL-USD"]  # SOL vanishes from the product list
+    w.ex.cancel(next(leg.order_id for leg in avax.legs if leg.kind == "bracket"))
+    r = w.engine.run_cycle()
+    assert any("SOL-USD" in e for e in r.errors)
+    assert w.sells("AVAX-USD") == pytest.approx(avax.base_size)  # AVAX was still repaired
+    assert r.entered == []
+
+
 def test_partial_fill_then_expiry_is_protected():
     w = World()
     w.cycle()
@@ -445,6 +481,21 @@ def test_restart_rebuilds_from_exchange():
         w.bar(close)
         w.cycle()
     assert w.position().half_taken and w.position().stop_price >= ENTRY
+
+
+def test_without_brackets_one_stop_trails_after_target():
+    w = World(brackets=False)
+    pos = w.enter()
+    assert [leg.kind for leg in pos.legs] == ["stop"] and pos.legs[0].base_size == pos.base_size
+    for close in (130.0, 140.0, 150.0):
+        w.bar(close)
+        w.cycle()
+    assert w.position().stop_price == pytest.approx(STOP)  # below target: no trailing yet
+    w.bar(160.0)
+    w.cycle()
+    pos = w.position()
+    assert not pos.half_taken and pos.stop_price > ENTRY  # whole position trails once 2R is reached
+    assert w.sells() == pytest.approx(pos.base_size)
 
 
 def test_withdrawal_is_not_counted_as_a_loss():

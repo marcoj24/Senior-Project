@@ -147,8 +147,8 @@ class Engine:
         res = CycleResult()
         try:
             self._step(res, "sync", self._sync)
-            self._step(res, "reconcile", self._reconcile)
-            if not res.errors:
+            if not res.errors:  # per-position steps: one broken position never blocks the others
+                self._step(res, "reconcile", self._reconcile)
                 self._protect_all(res)
                 self._trail_all(res)
             if not res.errors:
@@ -220,12 +220,13 @@ class Engine:
         by_cid = {o.client_order_id: o for o in self.ex.open_orders()}
         for key, s in pending.items():
             o = by_cid.get(key)
-            if o is not None and o.order_id not in self.orders:
-                self._register(o.order_id, "entry", o.product_id, key, o.base_size,
-                               candidate=s["candidate"], limit=o.limit_price, placed_ts=s["ts"])
+            if o is not None:
+                if o.order_id not in self.orders:
+                    self._register(o.order_id, "entry", o.product_id, key, o.base_size,
+                                   candidate=s["candidate"], limit=o.limit_price, placed_ts=s["ts"])
+                    self._log("entry_adopted", o.product_id, order_id=o.order_id, client_order_id=key)
                 s["status"] = "placed"
-                self._log("entry_adopted", o.product_id, order_id=o.order_id, client_order_id=key)
-            elif o is None:
+            else:
                 del self.setups[key]  # never reached the exchange; the setup may be retried
         self._save_setups()
 
@@ -339,30 +340,37 @@ class Engine:
     def _reconcile(self, res: CycleResult) -> None:
         bal = self.ex.balances()
         for pid in list(self.pos):
-            pos = self.pos[pid]
-            p = self._product(pid)
-            held = _held(bal, p)
-            if held >= round_down(pos.base_size, p.base_increment) - _EPS:
-                continue  # extra coins the bot did not buy are never adopted
-            self._cancel_legs(pos)
-            if pid not in self.pos:
-                continue  # a leg had filled; the fill closed the position
-            held = _held(self.ex.balances(), p)
-            if held >= pos.base_size - _EPS:
-                self._protect(pos)
-                continue
-            self._log("reconcile", pid, position_size=pos.base_size, balance=held)
-            if held >= p.min_base_size:
-                pos.base_size = held
-                self.store.save_position(pos)
-                self._alert("position reconciled", f"{pid}: balance fell to {held}; position shrunk")
-                self._protect(pos)
-            else:
-                self.store.delete_position(pid)
-                del self.pos[pid]
-                self.trades.pop(pid, None)
-                self._save_trades()
-                self._alert("position reconciled", f"{pid}: coins sold outside the bot; position removed")
+            try:
+                self._reconcile_one(self.pos[pid], bal)
+            except ExchangeError as e:  # one bad position must not stop the others being protected
+                res.errors.append(f"reconcile {pid}: {e}")
+                self._log("error", pid, where="reconcile", error=str(e))
+
+    def _reconcile_one(self, pos: Position, bal: dict[str, float]) -> None:
+        pid = pos.product_id
+        p = self._product(pid)
+        held = _held(bal, p)
+        if held >= round_down(pos.base_size, p.base_increment) - _EPS:
+            return  # extra coins the bot did not buy are never adopted
+        self._cancel_legs(pos)
+        if pid not in self.pos:
+            return  # a leg had filled; the fill closed the position
+        held = _held(self.ex.balances(), p)
+        if held >= pos.base_size - _EPS:
+            self._protect(pos)
+            return
+        self._log("reconcile", pid, position_size=pos.base_size, balance=held)
+        if held >= p.min_base_size:
+            pos.base_size = held
+            self.store.save_position(pos)
+            self._alert("position reconciled", f"{pid}: balance fell to {held}; position shrunk")
+            self._protect(pos)
+        else:
+            self.store.delete_position(pid)
+            del self.pos[pid]
+            self.trades.pop(pid, None)
+            self._save_trades()
+            self._alert("position reconciled", f"{pid}: coins sold outside the bot; position removed")
 
     # ---------------------------------------------------------------- 3. protect
 
@@ -464,6 +472,8 @@ class Engine:
             raise ExchangeError(f"{kind} leg {oid} is not live")
 
     def _register(self, oid: str, kind: str, pid: str, cid: str, size: float, **extra):
+        if oid in self.orders:  # already tracked: never reset its accounted fills
+            return self.ex.get_order(oid)
         rec = {"kind": kind, "product_id": pid, "client_order_id": cid, "size": size,
                "created_ts": self.now() - FILL_LOOKBACK_S, "placed_ts": self.now(),
                "acc_size": 0.0, "acc_value": 0.0, "acc_fee": 0.0, **extra}
@@ -518,21 +528,20 @@ class Engine:
         for leg in [lg for lg in pos.legs if lg.kind == "stop"]:
             self.ex.cancel(leg.order_id)
         pos.legs = [lg for lg in pos.legs if lg.kind != "stop"]
+        pos.stop_price = new_stop  # a failed placement below is re-placed at this stop by protect
         self.store.save_position(pos)
-        self._sync_orders(None)
-        if pid not in self.pos:
-            return
-        pos.stop_price = new_stop
-        self.store.save_position(pos)
-        p = self._product(pid)
-        size = _sub(round_down(pos.base_size, p.base_increment), sum(lg.base_size for lg in pos.legs))
-        if size < p.min_base_size:
-            return
         for attempt in range(2):
             try:
+                self._sync_orders(None)  # a cancelled leg may have filled first
+                if pid not in self.pos:
+                    return
                 if not any(lg.kind == "stop" for lg in pos.legs):
-                    self._place_leg(pos, "stop", size, new_stop)
-                self._log("stop_moved", pid, why=why, old_stop=old, new_stop=new_stop, size=size)
+                    p = self._product(pid)
+                    size = _sub(round_down(pos.base_size, p.base_increment),
+                                sum(lg.base_size for lg in pos.legs))
+                    if size >= p.min_base_size:
+                        self._place_leg(pos, "stop", size, new_stop)
+                self._log("stop_moved", pid, why=why, old_stop=old, new_stop=new_stop, size=pos.base_size)
                 return
             except ExchangeError as e:
                 self._log("error", pid, where="replace_stop", attempt=attempt + 1, error=str(e))
@@ -554,14 +563,13 @@ class Engine:
         roll_day(self.state, equity, today)
         lim = check_limits(self.state, equity, self.cfg)
         self.store.save_risk_state(self.state)
-        if lim.kill_triggered:
-            self._cancel_entries(res, "kill switch")
-            self._alert("kill switch", f"equity {equity:.2f} is {self.cfg.kill_drawdown:.0%} below the "
-                                       f"peak {self.state.peak_equity:.2f}; entries cancelled, stops kept")
+        if lim.kill_triggered or self.state.kill_switch:
             res.halted = lim.reason
-            return
-        if self.state.kill_switch:
+            if lim.kill_triggered:  # alert first: a failed cancel below must not swallow it
+                self._alert("kill switch", f"equity {equity:.2f} is {self.cfg.kill_drawdown:.0%} below the "
+                                           f"peak {self.state.peak_equity:.2f}; cancelling entries, stops kept")
             self._cancel_entries(res, "kill switch")
+            return
         self._expire_entries(res)
         if not lim.can_enter:
             res.halted = lim.reason
