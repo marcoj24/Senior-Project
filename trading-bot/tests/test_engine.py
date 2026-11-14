@@ -800,3 +800,150 @@ def test_malformed_position_does_not_escape():
     assert w.sells("SOL-USD") == pytest.approx(sol.base_size)  # SOL still repaired
     w.engine.watch_fills()  # does not raise
     assert w.engine.needs_watch() in (True, False)
+
+
+class RaisingAlerts(Alerts):
+    def send(self, title, body):
+        super().send(title, body)
+        raise RuntimeError("alert transport down")
+
+
+def test_dead_forced_exit_ioc_is_retried_by_watch():
+    w = World()
+    pos = w.enter()
+    gap_below_stop(w)
+    w.cycle()  # forced exit: legs cancelled, IOC placed
+    w.bar(80.0, low=78.0, high=82.0, open_=80.0)  # closes below the IOC limit: it dies unfilled
+    assert w.sells() == 0
+    assert w.engine.needs_watch()
+    w.watch()  # bid still below the stop: the exit is retried at once
+    [ioc] = [o for o in w.ex.open_orders() if o.kind == "ioc"]
+    assert ioc.base_size == pytest.approx(pos.base_size)
+
+
+def test_position_below_minimum_alerts_once_then_protects_when_it_grows():
+    w = World()
+    w.cycle()
+    [order] = w.entries()
+    w.ex.partial_fill(order.order_id, 0.005, ENTRY, T0)  # below the 0.01 minimum order size
+    for _ in range(10):
+        w.engine.watch_fills()
+    assert sum("minimum order size" in b for _, b in w.alerts.sent) == 1
+    w.ex.partial_fill(order.order_id, 0.5, ENTRY, T0)
+    w.watch()
+    assert w.sells() == pytest.approx(0.505)
+
+
+def test_dust_position_does_not_keep_watch_on():
+    w = World()
+    w.cycle()
+    [order] = w.entries()
+    w.ex.partial_fill(order.order_id, 0.005, ENTRY, T0)
+    w.engine.watch_fills()
+    w.ex.cancel(order.order_id)
+    w.engine.watch_fills()
+    assert w.position().base_size == pytest.approx(0.005) and w.entries() == []
+    assert not w.engine.needs_watch()
+    for _ in range(5):
+        w.engine.watch_fills()
+        w.engine.run_cycle()
+    assert sum("minimum order size" in b for _, b in w.alerts.sent) == 1
+    assert "missing stop" not in w.titles()
+
+
+def test_forced_exit_waits_for_unresolved_placement_before_cancelling():
+    w = World()
+    pos = w.enter()
+    pending = {"SOL-USD-stop-x": {"kind": "stop", "product_id": "SOL-USD", "size": 0.1}}
+    w.store.set_meta("pending", json.dumps(pending))
+    fail_times(w.ex, "get_order_by_client_id", 1000)
+    gap_below_stop(w)
+    w.engine.run_cycle()
+    assert all(w.ex.get_order(leg.order_id).status == "open" for leg in pos.legs)  # stops kept
+    assert not any(o.kind == "ioc" for o in w.ex._orders.values())
+
+
+def test_raising_alert_transport_never_escapes():
+    w = World()
+    w.alerts = RaisingAlerts()
+    w.engine = w.make_engine(w.store)
+    pos = w.enter()
+    w.ex.cancel(pos.legs[0].order_id)
+    w.engine.run_cycle()  # alerts "missing stop": the transport raises, the cycle does not
+    assert "missing stop" in w.titles() and w.sells() == pytest.approx(pos.base_size)
+    w.ex.cancel(w.position().legs[0].order_id)
+    w.engine.watch_fills()
+    assert w.sells() == pytest.approx(pos.base_size)
+    assert w.store.journal_rows("alert_failed")
+
+
+def test_engine_error_alerts_once_per_episode():
+    w = two_positions()
+    row = w.store._db.execute("SELECT data FROM positions WHERE product_id = 'AVAX-USD'").fetchone()
+    d = json.loads(row[0])
+    d["base_size"] = "oops"
+    with w.store._db:
+        w.store._db.execute("UPDATE positions SET data = ? WHERE product_id = 'AVAX-USD'", (json.dumps(d),))
+    w.engine.run_cycle()
+    w.engine.watch_fills()
+    alerts = w.titles().count("engine error")
+    errors = len(w.store.journal_rows("error"))
+    assert alerts >= 1
+    for _ in range(5):
+        w.engine.watch_fills()
+    assert w.titles().count("engine error") == alerts
+    assert len(w.store.journal_rows("error")) == errors  # same cycle period: not journaled again
+    w.clock.t += 15 * 60
+    w.engine.run_cycle()
+    assert w.titles().count("engine error") == alerts
+
+
+def test_equity_uses_last_bid_when_a_price_fails():
+    w = World(also=["AVAX-USD"])
+    w.cycle()
+    avax = next(o for o in w.entries() if o.product_id == "AVAX-USD")
+    sol = next(o for o in w.entries() if o.product_id == "SOL-USD")
+    w.ex.partial_fill(avax.order_id, avax.base_size, ENTRY, T0)
+    w.watch()
+    w.cycle()  # reads AVAX's bid
+    real = w.ex.bid_ask
+
+    def bid_ask(pid):
+        if pid == "AVAX-USD":
+            raise ExchangeError("no price")
+        return real(pid)
+
+    w.ex.bid_ask = bid_ask
+    w.edit_state(peak_equity=2000.0)
+    r = w.engine.run_cycle()
+    assert r.halted == "kill switch triggered"
+    assert w.ex.get_order(sol.order_id).status == "cancelled"
+    assert w.titles().count("stale price") == 1
+    w.engine.run_cycle()
+    assert w.titles().count("stale price") == 1
+    assert w.engine.equity() > 0
+
+
+def test_stop_moved_only_when_the_new_stop_is_live():
+    w = World()
+    w.enter()
+    for close in (130.0, 140.0, 150.0, 158.0):
+        w.bar(close)
+        w.cycle()
+    moved = len(w.store.journal_rows("stop_moved"))
+    real = w.ex.place_stop
+    calls = [0]
+
+    def dies_once(*args):
+        oid = real(*args)
+        calls[0] += 1
+        if calls[0] == 1:
+            w.ex.cancel(oid)  # accepted, then cancelled by the venue
+        return oid
+
+    w.ex.place_stop = dies_once
+    w.bar(175.0)
+    w.cycle()  # first attempt dead, second attempt live: coverage holds
+    rows = w.store.journal_rows("stop_moved")
+    assert len(rows) == moved + 1 and calls[0] == 2
+    assert w.sells() == pytest.approx(w.position().base_size)

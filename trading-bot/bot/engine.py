@@ -90,6 +90,8 @@ class Engine:
         self.trades: dict[str, dict] = self._meta("trades", {})
         self.setups: dict[str, dict] = self._meta("setups", {})
         self.pending: dict[str, dict] = self._meta("pending", {})  # exit/leg placements not yet registered
+        self.episodes: dict[str, dict] = self._meta("episodes", {})  # alert-once state, by episode key
+        self.last_bid: dict[str, float] = self._meta("last_bid", {})
         self.state = self.store.load_risk_state()
         self._grown, self._target_missed, self._exited, self._daily_cache = set(), set(), [], {}
 
@@ -109,8 +111,46 @@ class Engine:
         self.store.journal(_kind, _pid, data, self.now())
 
     def _alert(self, title: str, body: str) -> None:
-        self._log("alert", None, title=title, body=body)
-        self.alerts.send(title, body)
+        """Never raises: a broken alert transport must not stop protection."""
+        try:
+            self._log("alert", None, title=title, body=body)
+            self.alerts.send(title, body)
+        except Exception as e:
+            try:
+                self._log("alert_failed", None, title=title, error=repr(e))
+            except Exception:
+                pass
+
+    def _episode(self, key: str, value=True) -> bool:
+        """Start (or keep) an alert episode. True only when it is new or its value changed."""
+        if self.episodes.get(key) == value:
+            return False
+        self.episodes[key] = value
+        self._set_meta("episodes", self.episodes)
+        return True
+
+    def _end_episode(self, key: str) -> None:
+        if key in self.episodes:
+            del self.episodes[key]
+            self._set_meta("episodes", self.episodes)
+
+    def _dust(self, pos: Position, why: str) -> None:
+        """A position too small to carry a sell order: alert and journal once per size."""
+        if self._episode(f"dust|{pos.product_id}", pos.base_size):
+            self._log("dust", pos.product_id, size=pos.base_size, why=why)
+            self._alert("unprotected", f"{pos.product_id}: {pos.base_size} is below the minimum order size ({why})")
+
+    def _is_dust(self, pos: Position) -> bool:
+        p = self._product(pos.product_id)
+        return round_down(pos.base_size, p.base_increment) < p.min_base_size
+
+    def _bid(self, pid: str) -> float:
+        bid = self.ex.bid_ask(pid)[0]
+        if self.last_bid.get(pid) != bid:
+            self.last_bid[pid] = bid
+            self._set_meta("last_bid", self.last_bid)
+        self._end_episode(f"stale|{pid}")
+        return bid
 
     def _today(self) -> str:
         return datetime.fromtimestamp(self.now(), timezone.utc).strftime("%Y-%m-%d")
@@ -134,8 +174,19 @@ class Engine:
 
     def equity(self) -> float:
         """USD cash plus the coins held by bot positions, valued at bid."""
+        if not hasattr(self, "pos"):
+            self._load()
         cash = self.ex.balances().get("USD", 0.0)
-        return cash + sum(p.base_size * self.ex.bid_ask(pid)[0] for pid, p in self.pos.items())
+        total = cash
+        for pid, p in self.pos.items():
+            try:
+                bid = self._bid(pid)
+            except ExchangeError as e:  # value it at the last known bid so limits still run
+                bid = self.last_bid.get(pid, p.entry_price)
+                if self._episode(f"stale|{pid}"):
+                    self._alert("stale price", f"{pid}: no bid ({e}); valued at the last known {bid}")
+            total += p.base_size * bid
+        return total
 
     def needs_watch(self) -> bool:
         """True while an entry rests, an order placement is unresolved, or a position is not fully
@@ -155,7 +206,8 @@ class Engine:
     def watch_fills(self) -> None:
         """Fill poll: resolve lost replies, account entry fills, then re-protect ANY position whose
         open legs do not cover it, so an uncovered position is retried on every poll."""
-        self._load()
+        if not self._guard(None, None, "load", self._load):
+            return
         self._resolve_all(None)
 
         def entry_fills():
@@ -168,8 +220,9 @@ class Engine:
             self._repair_coverage()
 
     def run_cycle(self) -> CycleResult:
-        self._load()
         res = CycleResult()
+        if not self._guard(res, None, "load", self._load):
+            return res
         try:
             if self._step(res, "sync", self._sync):  # without a sync the bot's view is stale
                 self._after_sync(res)
@@ -180,7 +233,7 @@ class Engine:
                 self._step(res, "limits", lambda r: self._limits_and_entries(r, entries_ok))
         finally:
             res.exited = list(self._exited)
-            self._record(res)
+            self._guard(None, None, "record", lambda: self._record(res))
         return res
 
     # ---------------------------------------------------------------- cycle plumbing
@@ -191,8 +244,11 @@ class Engine:
     def _guard(self, res: CycleResult | None, pid: str | None, where: str, fn, alert: str | None = None) -> bool:
         """Run one unit of work. An ExchangeError, or any unexpected error, is journaled, recorded
         and (unexpected ones always) alerted; it never escapes, so the next unit still runs."""
+        key = f"engine|{where}|{pid}"
         try:
             fn()
+            if key in getattr(self, "episodes", {}):
+                self._end_episode(key)
             return True
         except ExchangeError as e:
             self._log("error", pid, where=where, error=str(e))
@@ -200,9 +256,18 @@ class Engine:
                 self._alert(alert, f"{pid or where}: {e}")
             msg = str(e)
         except Exception as e:
-            self._log("error", pid, where=where, error=repr(e), traceback=traceback.format_exc())
-            self._alert("engine error", f"{where} {pid or ''}: {e!r}")
             msg = repr(e)
+            try:
+                period = self.now() // (self.cfg.cycle_minutes * 60)
+                seen = getattr(self, "episodes", {}).get(key)
+                if seen is None or seen != period:
+                    self._log("error", pid, where=where, error=msg, traceback=traceback.format_exc())
+                if seen is None:
+                    self._alert("engine error", f"{where} {pid or ''}: {msg}")
+                if hasattr(self, "episodes"):
+                    self._episode(key, period)
+            except Exception:
+                pass  # the store itself is failing; nothing more can be recorded
         if res is not None:
             res.errors.append(f"{where} {pid}: {msg}" if pid else f"{where}: {msg}")
         return False
@@ -216,7 +281,10 @@ class Engine:
             self._alert("cycle failing", f"{streak} cycles in a row failed: {'; '.join(res.errors)}")
         self._log("cycle", None, **asdict(res))
         if not res.errors:
-            self.alerts.heartbeat()
+            try:
+                self.alerts.heartbeat()
+            except Exception as e:
+                self._log("alert_failed", None, title="heartbeat", error=repr(e))
 
     # ---------------------------------------------------------------- 1. sync
 
@@ -314,8 +382,7 @@ class Engine:
         raises, the order is looked up by client id: found -> it is tracked as if placed; lookup also
         failing -> the intent stays pending and is resolved by the next sync or fill poll.
         Returns (order_id, recovered)."""
-        if any(r["product_id"] == pid for r in self.pending.values()):
-            raise ExchangeError(f"{pid}: an earlier order placement is unresolved")  # might hold the coins
+        self._check_no_pending(pid)
         cid = self._cid(pid, kind)
         self.pending[cid] = {"kind": kind, "product_id": pid, "size": size, **extra}
         self._save_pending()
@@ -335,6 +402,10 @@ class Engine:
         self.pending.pop(cid, None)
         self._save_pending()
         return oid, False
+
+    def _check_no_pending(self, pid: str) -> None:
+        if any(r["product_id"] == pid for r in self.pending.values()):
+            raise ExchangeError(f"{pid}: an earlier order placement is unresolved")  # might hold the coins
 
     def _entry_changed(self, oid: str, rec: dict) -> bool:
         o = self.ex.get_order(oid)
@@ -495,14 +566,17 @@ class Engine:
 
     def _protect_position(self, pos: Position) -> None:
         pid = pos.product_id
-        if self._ioc_in_flight(pid):
+        open_ids = {o.order_id for o in self.ex.open_orders()}
+        if self._ioc_in_flight(pid, open_ids):
             return  # a forced or target exit is in flight
-        bid, _ = self.ex.bid_ask(pid)
+        bid = self._bid(pid)
         if bid < pos.stop_price:
             self._forced_exit(pos, bid)
             return
+        if self._is_dust(pos):
+            self._dust(pos, "cannot be protected")
+            return
         p = self._product(pid)
-        open_ids = {o.order_id for o in self.ex.open_orders()}
         covered = sum(leg.base_size for leg in pos.legs if leg.order_id in open_ids)
         need = round_down(pos.base_size, p.base_increment)
         if any(leg.order_id not in open_ids for leg in pos.legs) or abs(covered - need) > _EPS:
@@ -511,13 +585,17 @@ class Engine:
 
     def _forced_exit(self, pos: Position, bid: float) -> None:
         pid = pos.product_id
+        self._check_no_pending(pid)  # before cancelling anything: the IOC could not be placed
+        if self._is_dust(pos):
+            self._dust(pos, "too small to sell")
+            return
         self._cancel_legs(pos)
         if pid not in self.pos:
             return
         p = self._product(pid)
         size = round_down(min(pos.base_size, _held(self.ex.balances(), p)), p.base_increment)
         if size < p.min_base_size:
-            self._alert("unprotected", f"{pid}: {size} is below the minimum order size")
+            self._dust(pos, "too small to sell")
             return
         limit = round_down(bid * FORCED_EXIT_PRICE, p.quote_increment)
         oid, _ = self._place_order("ioc", pid, size, lambda cid: self.ex.place_ioc_sell(pid, size, limit, cid))
@@ -531,8 +609,9 @@ class Engine:
                 self._guard(res, pid, "protect fill", lambda: self._protect(self.pos[pid]), alert="unprotected")
 
     def _uncovered(self, pos: Position, open_ids: set[str]) -> bool:
-        """Legs missing or not summing to the position, with no exit IOC in flight to explain it."""
-        if self._ioc_in_flight(pos.product_id):
+        """Legs missing or not summing to the position, with no live exit IOC to explain it.
+        A dust position (below the minimum order size) cannot be covered and does not count."""
+        if self._ioc_in_flight(pos.product_id, open_ids) or self._is_dust(pos):
             return False
         need = round_down(pos.base_size, self._product(pos.product_id).base_increment)
         covered = sum(leg.base_size for leg in pos.legs if leg.order_id in open_ids)
@@ -540,6 +619,9 @@ class Engine:
 
     def _repair_coverage(self) -> None:
         """Fill-poll repair of any uncovered position. Alerts once per uncovered episode."""
+        self._guard(None, None, "watch repair", self._repair_coverage_inner)
+
+    def _repair_coverage_inner(self) -> None:
         alerted = self._meta("uncovered_alerted", {})
         open_ids: set[str] = set()
         if not self._guard(None, None, "watch open orders",
@@ -572,12 +654,12 @@ class Engine:
         open_ids = {o.order_id for o in self.ex.open_orders()}
         if not self._uncovered(pos, open_ids):
             return
-        bid, _ = self.ex.bid_ask(pid)
+        bid = self._bid(pid)
         covered = sum(leg.base_size for leg in pos.legs)
         if bid < pos.stop_price:
             self._forced_exit(pos, bid)
         elif all(leg.order_id in open_ids for leg in pos.legs) and covered < pos.base_size:
-            self._cover_gap(pos)  # live legs stay; only the uncovered part gets a stop
+            self._cover_gap(pos)  # live legs stay; only the uncovered part gets a stop (if it can)
         else:
             self._protect(pos)
 
@@ -591,8 +673,9 @@ class Engine:
         p = self._product(pid)
         size = round_down(pos.base_size, p.base_increment)
         if size < p.min_base_size:
-            self._alert("unprotected", f"{pid}: {pos.base_size} is below the minimum order size")
+            self._dust(pos, "cannot be protected")
             return
+        self._end_episode(f"dust|{pid}")
         split = None if pos.half_taken else self._split(size, p)
         if split:  # leg a carries the target: a bracket, or a plain stop the bot sells itself at target
             self._place_leg(pos, "bracket" if self.ex.supports_bracket else "stop", split[0], pos.stop_price)
@@ -625,6 +708,8 @@ class Engine:
             self.store.save_position(pos)
         o = self.ex.get_order(oid)
         if o.status == "cancelled" or abs(o.base_size - size) > _EPS:
+            pos.legs = [lg for lg in pos.legs if lg.order_id != oid]  # never count a dead leg
+            self.store.save_position(pos)
             raise ExchangeError(f"{kind} leg {oid} is not live")
 
     def _register(self, oid: str, kind: str, pid: str, cid: str, size: float, **extra):
@@ -670,7 +755,7 @@ class Engine:
         a = cur if cur else pos.atr
         if self._ioc_in_flight(pid):
             return
-        bid, _ = self.ex.bid_ask(pid)
+        bid = self._bid(pid)
         p = self._product(pid)
         too_small = self._split(round_down(pos.base_size, p.base_increment), p) is None
         if not (pos.half_taken or (too_small and max(pos.highest_close, bid) >= pos.target_price)):
@@ -687,7 +772,7 @@ class Engine:
             return
         p = self._product(pid)
         split = self._split(round_down(pos.base_size, p.base_increment), p)
-        bid, _ = self.ex.bid_ask(pid)
+        bid = self._bid(pid)
         if split is None or bid < pos.target_price:
             return
         leg = next((lg for lg in pos.legs if lg.kind == "stop" and abs(lg.base_size - split[0]) <= _EPS), None)
@@ -733,10 +818,12 @@ class Engine:
         if gap >= p.min_base_size:
             self._place_leg(pos, "stop", gap, pos.stop_price)
         elif gap > _EPS:
-            self._alert("unprotected", f"{pid}: {gap} uncovered is below the minimum order size")
+            self._protect(pos)  # the gap alone is below the minimum: re-place merged legs
 
-    def _ioc_in_flight(self, pid: str) -> bool:
-        return any(r["kind"] == "ioc" and r["product_id"] == pid for r in self.orders.values())
+    def _ioc_in_flight(self, pid: str, open_ids: set[str] | None = None) -> bool:
+        """An exit IOC for the product is tracked (and, given the venue's open ids, still open)."""
+        return any(r["kind"] == "ioc" and r["product_id"] == pid and (open_ids is None or oid in open_ids)
+                   for oid, r in self.orders.items())
 
     def _replace_stop(self, pos: Position, new_stop: float, why: str) -> None:
         """Verified cancel-and-replace of the stop legs at a higher stop. Stops never move down."""
@@ -754,12 +841,18 @@ class Engine:
                 self._sync_orders(None)  # a cancelled leg may have filled first
                 if pid not in self.pos:
                     return
+                for lg in [lg for lg in pos.legs if lg.kind == "stop"]:  # confirm a stop from attempt 1
+                    if self.ex.get_order(lg.order_id).status != "open":
+                        pos.legs.remove(lg)
+                        self.store.save_position(pos)
                 if not any(lg.kind == "stop" for lg in pos.legs):
                     p = self._product(pid)
                     size = _sub(round_down(pos.base_size, p.base_increment),
                                 sum(lg.base_size for lg in pos.legs))
-                    if size >= p.min_base_size:
-                        self._place_leg(pos, "stop", size, new_stop)
+                    if size < p.min_base_size:
+                        self._dust(pos, "stop remainder")
+                        return
+                    self._place_leg(pos, "stop", size, new_stop)  # raises unless confirmed live
                 self._log("stop_moved", pid, why=why, old_stop=old, new_stop=new_stop, size=pos.base_size)
                 return
             except ExchangeError as e:
@@ -866,7 +959,7 @@ class Engine:
         """Open risk, exposure and free cash across positions and resting entries."""
         risk = exposure = reserved = 0.0
         for pid, p in self.pos.items():
-            bid = self.ex.bid_ask(pid)[0]
+            bid = self._bid(pid)
             exit_cost = p.stop_price * (fees.taker + self.cfg.slippage)
             risk += p.base_size * (max(0.0, p.entry_price - p.stop_price) + exit_cost)
             exposure += p.base_size * bid
