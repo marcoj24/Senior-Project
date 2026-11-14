@@ -203,3 +203,19 @@ def test_fail_after_next_performs_the_call_then_raises_once(px):
     o = px.get_order_by_client_id("lost")
     assert o is not None and o.status == "open" and o.base_size == 0.1
     px.place_entry("SOL-USD", 0.1, 100.0, "next")  # only once
+
+
+def test_set_products_replaces_the_listing(px):
+    eth = Product("ETH-USD", "ETH", "USD", 1e-8, 0.01, 1e-8, "online", 5e6)
+    px.set_products([SOL, eth])
+    assert {p.product_id for p in px.products()} == {"SOL-USD", "ETH-USD"}
+    px.place_entry("ETH-USD", 0.1, 100.0, "e1")  # a newly listed product can be traded
+    px.set_products([eth])
+    assert [p.product_id for p in px.products()] == ["ETH-USD"]
+
+
+def test_set_products_keeps_products_with_open_orders(px):
+    px.place_entry("SOL-USD", 0.1, 100.0, "c1")
+    with pytest.raises(ExchangeError):
+        px.set_products([])
+    assert [p.product_id for p in px.products()] == ["SOL-USD"]

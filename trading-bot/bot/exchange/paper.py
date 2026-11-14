@@ -75,6 +75,15 @@ class PaperExchange:
                 if o.status == "open" and o.product_id == product_id:
                     self._process(o, candle)
 
+    def set_products(self, products: list[Product]) -> None:
+        """Replace the product listing (a backtest relists each simulated day with point-in-time
+        volume). A product with an open order cannot be dropped."""
+        new = {p.product_id: p for p in products}
+        busy = {o.product_id for o in self._orders.values() if o.status == "open"} - set(new)
+        if busy:
+            raise ExchangeError(f"products with open orders cannot be dropped: {sorted(busy)}")
+        self._products = new
+
     def deposit(self, amount: float, ts: int) -> None:
         self._cash += amount
         self._transfers.append(Transfer(ts, amount))
