@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
 
@@ -43,6 +44,8 @@ def size_position(
         return _skip("heat cap")
     risk_usd = min(equity * cfg.risk_per_trade * multiplier, heat_room)
     loss_per_usd = (cand.entry - cand.stop) / cand.entry + loss_cost
+    if loss_per_usd <= 0:
+        return _skip("invalid stop")
     value = risk_usd / loss_per_usd
     position_cap = cfg.max_position_small if equity < cfg.small_equity else cfg.max_position
     value = min(
@@ -72,6 +75,7 @@ class RiskState:
     kill_switch: bool
     consecutive_losses: int
     post_reset_remaining: int
+    halt_day: str | None = None  # UTC day on which the daily halt latched
 
 
 @dataclass(frozen=True)
@@ -85,16 +89,22 @@ def roll_day(state: RiskState, equity: float, today: str) -> None:
     if today != state.day:
         state.day = today
         state.day_start_equity = equity
+        state.halt_day = None
 
 
 def check_limits(state: RiskState, equity: float, cfg: Config) -> LimitStatus:
+    if not math.isfinite(equity) or equity <= 0:
+        return LimitStatus(False, "invalid equity", False)
     state.peak_equity = max(state.peak_equity, equity)
     if state.kill_switch:
         return LimitStatus(False, "kill switch latched", False)
     if equity <= state.peak_equity * (1 - cfg.kill_drawdown) + _EPS:
         state.kill_switch = True
         return LimitStatus(False, "kill switch triggered", True)
+    if state.halt_day == state.day:
+        return LimitStatus(False, "daily loss halt", False)
     if equity <= state.day_start_equity * (1 - cfg.daily_loss_halt) + _EPS:
+        state.halt_day = state.day
         return LimitStatus(False, "daily loss halt", False)
     return LimitStatus(True, None, False)
 

@@ -51,3 +51,8 @@ def test_multiplier_floor_skips():
 def test_below_minimum_skips():
     r = size_position(1.0, 1.0, 0, 0, CAND, 0.02, PROD, 1.0, Config())
     assert r.skipped == "below minimum" and r.base_size == 0.0
+
+
+def test_invalid_stop_skips():
+    cand = Candidate("SOL-USD", 100.0, 100.0, 120.0, 4.0, 98.0, 1.0, 0)
+    assert size_position(25, 25, 0, 0, cand, 0.0, PROD, 1.0, Config()).skipped == "invalid stop"

@@ -88,3 +88,20 @@ def test_risk_on_allows_two_per_group():
     assert correlation_ok("SOL-USD", ["AVAX-USD"], "risk_on")
     assert correlation_ok("BTC-USD", held, "risk_on")
     assert correlation_ok("ETH-USD", ["BTC-USD"], "risk_on")
+
+
+def test_daily_halt_latches_until_next_day():
+    s = RiskState(100, "2026-01-01", 100, False, 0, 0)
+    assert not check_limits(s, 94.0, Config()).can_enter
+    st = check_limits(s, 99.0, Config())
+    assert not st.can_enter and "daily" in st.reason
+    roll_day(s, 99.0, "2026-01-02")
+    assert check_limits(s, 99.0, Config()).can_enter
+
+
+def test_invalid_equity_fails_closed_without_state_change():
+    for bad in (float("nan"), float("inf"), 0.0, -5.0):
+        s = RiskState(100, "2026-01-01", 100, False, 0, 0)
+        st = check_limits(s, bad, Config())
+        assert not st.can_enter and st.reason == "invalid equity" and not st.kill_triggered
+        assert (s.peak_equity, s.kill_switch, s.halt_day) == (100, False, None)
