@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from bot.exchange.base import ExchangeError
 from bot.models import Candle, Fees, Fill, Order, Product, Transfer
@@ -18,6 +18,7 @@ class _Order:
     target: float | None
     created_ts: int
     filled_size: float = 0.0
+    filled_value: float = 0.0
     status: str = "open"
     stop_triggered: bool = False  # bracket: a triggered stop leg has cancelled the target leg
 
@@ -25,11 +26,12 @@ class _Order:
     def remaining(self) -> float:
         return self.base_size - self.filled_size
 
-    def snapshot(self) -> Order:
+    def snapshot(self, with_avg: bool = True) -> Order:
+        avg = self.filled_value / self.filled_size if with_avg and self.filled_size > 0 else None
         return Order(
             self.order_id, self.client_order_id, self.product_id, self.kind, self.base_size,
             self.filled_size, self.status, self.limit_price, self.stop_trigger, self.target,
-            self.created_ts,
+            self.created_ts, avg,
         )
 
 
@@ -51,6 +53,12 @@ class PaperExchange:
         self.supports_bracket = supports_bracket
         self.fail_next: str | None = None  # the named call raises instead of running, once
         self.fail_after_next: str | None = None  # the named call runs, then raises, once (lost reply)
+        # Fill-reporting controls. Order status (filled_size) is always exact and immediate; these
+        # only change what fills() and the orders' average fill price report.
+        self.hold_fills = False  # fills made while True stay out of fills() until release_fills()
+        self.fill_size_factor = 1.0  # fills() reports each size times this (sizes not summing to filled_size)
+        self.report_avg_price = True  # False: orders carry no average fill price
+        self._held_fills: list[Fill] = []
         self._cash = cash
         self._coins: dict[str, float] = {}
         self._fees = fees
@@ -89,12 +97,19 @@ class PaperExchange:
         self._transfers.append(Transfer(ts, amount))
 
     def partial_fill(self, order_id: str, base_size: float, price: float, ts: int) -> None:
+        """Fill part (or all) of an open order at `price`. A stop or bracket fills as its stop."""
         o = self._orders.get(order_id)
-        if o is None or o.kind != "entry" or o.status != "open":
-            raise ExchangeError(f"no open entry order {order_id}")
+        if o is None or o.status != "open":
+            raise ExchangeError(f"no open order {order_id}")
         if base_size <= 0 or base_size > o.remaining + _EPS:
             raise ExchangeError("partial fill size out of range")
-        self._fill(o, min(base_size, o.remaining), price, ts, "entry")
+        reason = {"entry": "entry", "ioc": "ioc"}.get(o.kind, "stop")
+        self._fill(o, min(base_size, o.remaining), price, ts, reason)
+
+    def release_fills(self) -> None:
+        """Fills withheld by hold_fills become visible (they keep their own timestamps)."""
+        self._fills.extend(self._held_fills)
+        self._held_fills = []
 
     # --- Exchange ---------------------------------------------------------------------------
 
@@ -187,20 +202,23 @@ class PaperExchange:
 
     def open_orders(self) -> list[Order]:
         self._maybe_fail("open_orders")
-        return [o.snapshot() for o in self._orders.values() if o.status == "open"]
+        return [o.snapshot(self.report_avg_price) for o in self._orders.values() if o.status == "open"]
 
     def get_order(self, order_id: str) -> Order:
         self._maybe_fail("get_order")
-        return self._get(order_id).snapshot()
+        return self._get(order_id).snapshot(self.report_avg_price)
 
     def get_order_by_client_id(self, client_order_id: str) -> Order | None:
         self._maybe_fail("get_order_by_client_id")
         oid = self._by_client_id.get(client_order_id)
-        return self._orders[oid].snapshot() if oid else None
+        return self._orders[oid].snapshot(self.report_avg_price) if oid else None
 
     def fills(self, since_ts: int) -> list[Fill]:
         self._maybe_fail("fills")
-        return [f for f in self._fills if f.ts >= since_ts]
+        out = [f for f in self._fills if f.ts >= since_ts]
+        if self.fill_size_factor != 1.0:
+            out = [replace(f, base_size=f.base_size * self.fill_size_factor) for f in out]
+        return out
 
     def transfers(self, since_ts: int) -> list[Transfer]:
         self._maybe_fail("transfers")
@@ -275,7 +293,9 @@ class PaperExchange:
             left = self._coins.get(base, 0.0) - size
             self._coins[base] = 0.0 if abs(left) < _EPS else left
         o.filled_size += size
+        o.filled_value += price * size
         if o.remaining <= _EPS:
             o.filled_size = o.base_size
             o.status = "filled"
-        self._fills.append(Fill(o.order_id, o.product_id, side, price, size, fee, ts, reason))
+        (self._held_fills if self.hold_fills else self._fills).append(
+            Fill(o.order_id, o.product_id, side, price, size, fee, ts, reason))

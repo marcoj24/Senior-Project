@@ -24,6 +24,7 @@ slippage: 0.001             # slippage allowance, fraction of price
 stop_limit_offset: 0.05     # stop-limit offset below trigger, fraction
 trail_min_improve_atr: 0.5  # trail stop only when improvement >= this many ATR
 entry_ttl_hours: 24         # entry order lifetime in hours
+fill_wait_cycles: 3         # cycles to wait for an order's fill prices before closing the trade on estimates
 setup_valid_candles: 12     # setup validity in four-hour candles
 min_volume_24h_usd: 5000000 # minimum 24h volume for the universe
 max_spread: 0.002           # maximum bid/ask spread, fraction

@@ -399,9 +399,17 @@ class CoinbaseExchange:
         target = None
         if kind == "bracket":  # the SDK's limit_price is the take-profit; the stop leg's limit is not exposed
             limit, target = None, limit
+        filled = _num(o, "filled_size", what)
+        avg = None  # optional: only an estimate for when fills() never arrive, so a bad value is dropped
+        if filled > 0 and o.get("average_filled_price") not in (None, ""):
+            try:
+                avg = _num(o, "average_filled_price", what)
+            except ExchangeError:
+                avg = None
+            avg = avg if avg and avg > 0 else None
         return Order(oid, str(o.get("client_order_id") or ""), str(_req(o, "product_id", what)), kind,
-                     _num(c, "base_size", what), _num(o, "filled_size", what), _ORDER_STATUS[raw_status],
-                     limit, trigger, target, _ts(_req(o, "created_time", what), what))
+                     _num(c, "base_size", what), filled, _ORDER_STATUS[raw_status],
+                     limit, trigger, target, _ts(_req(o, "created_time", what), what), avg)
 
     def open_orders(self) -> list[Order]:
         orders = self._pages("list_orders", "orders", order_status=["OPEN"], retail_portfolio_id=self._portfolio)

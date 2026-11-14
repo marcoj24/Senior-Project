@@ -31,4 +31,14 @@ def test_builder_defaults():
     assert c.always_include == ["BTC-USD", "ETH-USD", "SOL-USD"]
     assert (c.model_small, c.model_large) == ("claude-haiku-5-5", "claude-sonnet-5-5")
     assert (c.alert_url, c.heartbeat_url, c.db_path) == (None, None, "bot.db")
+    assert c.fill_wait_cycles == 3
     assert Config().always_include is not c.always_include
+
+
+def test_example_file_lists_every_setting_at_its_default():
+    from dataclasses import fields
+    from pathlib import Path
+    import yaml
+    path = Path(__file__).resolve().parent.parent / "config.example.yaml"
+    assert set(yaml.safe_load(path.read_text())) == {f.name for f in fields(Config)}
+    assert load_config(str(path)) == Config()

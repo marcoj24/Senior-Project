@@ -80,6 +80,7 @@ class Order:
     stop_trigger: float | None
     target: float | None
     created_ts: int
+    avg_fill_price: float | None = None  # the venue's own average price of what has filled, if it reports one
 
 
 @dataclass(frozen=True)

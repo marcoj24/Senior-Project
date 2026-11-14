@@ -408,6 +408,19 @@ def test_get_order_maps_fields():
     assert c.named("get_order") == [{"order_id": "oid-1"}]
 
 
+def test_order_carries_the_venues_average_fill_price_when_present():
+    """SDK types/orders_types.py: Order.average_filled_price. Optional: absent, empty or zero -> None."""
+    def avg(**fields):
+        c = FakeClient(get_order=GetOrderResponse({"order": {**order_dict(status="FILLED", filled="0.5"), **fields}}))
+        return make(c).get_order("oid-1").avg_fill_price
+
+    assert avg(average_filled_price="99.5") == 99.5
+    assert avg() is None and avg(average_filled_price="") is None and avg(average_filled_price="0") is None
+    c = FakeClient(get_order=GetOrderResponse({"order": {**order_dict(filled="0"), "average_filled_price": "99.5"}}))
+    assert make(c).get_order("oid-1").avg_fill_price is None  # nothing filled: no price
+    assert avg(average_filled_price="x") is None  # unreadable: dropped, the order itself still reads
+
+
 @pytest.mark.parametrize("status,mapped", [("FILLED", "filled"), ("CANCELLED", "cancelled"),
                                            ("EXPIRED", "cancelled"), ("FAILED", "cancelled"),
                                            ("PENDING", "open"), ("QUEUED", "open"), ("CANCEL_QUEUED", "open")])

@@ -219,3 +219,35 @@ def test_set_products_keeps_products_with_open_orders(px):
     with pytest.raises(ExchangeError):
         px.set_products([])
     assert [p.product_id for p in px.products()] == ["SOL-USD"]
+
+
+def test_partial_fill_of_a_stop_and_average_fill_price(px):
+    oid = px.place_entry("SOL-USD", 0.1, 100.0, "c1")
+    px.partial_fill(oid, 0.1, 100.0, 50)
+    sid = px.place_stop("SOL-USD", 0.1, 95.0, 90.0, "c2")
+    px.partial_fill(sid, 0.04, 94.0, 60)
+    px.partial_fill(sid, 0.04, 92.0, 61)
+    o = px.get_order(sid)
+    assert o.status == "open" and o.filled_size == pytest.approx(0.08)
+    assert o.avg_fill_price == pytest.approx(93.0)
+    assert [f.reason for f in px.fills(60)] == ["stop", "stop"]
+    assert px.get_order(px.place_entry("SOL-USD", 0.01, 50.0, "c3")).avg_fill_price is None  # nothing filled
+    px.report_avg_price = False
+    assert px.get_order(sid).avg_fill_price is None
+    assert all(o.avg_fill_price is None for o in px.open_orders())
+
+
+def test_fill_reporting_controls_never_touch_order_status(px):
+    oid = px.place_entry("SOL-USD", 0.1, 100.0, "c1")
+    px.hold_fills = True
+    px.partial_fill(oid, 0.04, 100.0, 50)
+    assert px.fills(0) == [] and px.get_order(oid).filled_size == pytest.approx(0.04)  # status is immediate
+    assert px.balances()["SOL"] == pytest.approx(0.04)
+    px.hold_fills = False
+    px.partial_fill(oid, 0.06, 100.0, 51)
+    assert [f.base_size for f in px.fills(0)] == pytest.approx([0.06])
+    px.release_fills()
+    assert sorted(f.base_size for f in px.fills(0)) == pytest.approx([0.04, 0.06])
+    px.fill_size_factor = 0.5  # reported sizes no longer sum to filled_size
+    assert sum(f.base_size for f in px.fills(0)) == pytest.approx(0.05)
+    assert px.get_order(oid).filled_size == pytest.approx(0.1)

@@ -35,6 +35,7 @@ class Config:
     stop_limit_offset: float = 0.05
     trail_min_improve_atr: float = 0.5
     entry_ttl_hours: int = 24
+    fill_wait_cycles: int = 3  # cycles a finished order waits for its fills before it is priced by estimate
     setup_valid_candles: int = 12
     min_volume_24h_usd: float = 5_000_000
     max_spread: float = 0.002
