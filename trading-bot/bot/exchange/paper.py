@@ -39,9 +39,10 @@ class PaperExchange:
     Fill rules, applied per open order (oldest first) to each candle fed with fills=True:
     - entry: fills at its limit only if candle.low < limit (strictly through); maker fee.
     - stop / bracket stop: triggers if candle.low <= trigger; price = min(trigger, candle.open);
-      if that price < stop limit the order stays open (gap) and is retried on later candles
-      under the same rule; taker fee. A triggered bracket stop cancels the target leg.
-    - bracket target: fills at target if candle.high > target and the stop did not trigger; maker fee.
+      if that price < stop limit the order stays open (gap), marked triggered, and rests as a
+      limit sell: on a later candle it fills at max(stop_limit, candle.open) if
+      candle.high >= stop_limit; taker fee. A triggered bracket stop cancels the target leg.
+    - bracket target: fills at target if candle.high > target and the stop never triggered; maker fee.
     - ioc sell: fills at max(limit, close) if close >= limit, else cancels; taker fee.
     """
 
@@ -223,12 +224,15 @@ class PaperExchange:
             if c.low < o.limit_price:
                 self._fill(o, o.remaining, o.limit_price, c.ts, "entry")
         elif o.kind in ("stop", "bracket"):
-            if c.low <= o.stop_trigger:
+            if o.stop_triggered:  # gapped earlier: now a resting limit sell at stop_limit
+                if c.high >= o.limit_price:
+                    self._fill(o, o.remaining, max(o.limit_price, c.open), c.ts, "stop")
+            elif c.low <= o.stop_trigger:
                 o.stop_triggered = True
                 price = min(o.stop_trigger, c.open)
                 if price >= o.limit_price:
                     self._fill(o, o.remaining, price, c.ts, "stop")
-            elif o.kind == "bracket" and not o.stop_triggered and c.high > o.target:
+            elif o.kind == "bracket" and c.high > o.target:
                 self._fill(o, o.remaining, o.target, c.ts, "target")
         elif o.kind == "ioc":
             if c.close >= o.limit_price:

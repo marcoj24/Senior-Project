@@ -39,11 +39,33 @@ def test_gap_through_stop_limit_leaves_stop_unfilled(px):
     assert len(px.fills(0)) == 1  # only the entry
 
 
+def test_gapped_stop_rests_as_limit_sell(px):
+    hold_tenth(px)
+    sid = px.place_stop("SOL-USD", 0.1, 90.0, 85.5, "s1")
+    px.feed("SOL-USD", H, Candle(H, 80, 82, 78, 81, 1))  # gap: triggered, unfilled
+    px.feed("SOL-USD", H, Candle(2 * H, 83, 85.0, 82, 84, 1))  # high 85.0 < 85.5
+    assert px.get_order(sid).status == "open" and px.balances()["SOL"] == 0.1
+    px.feed("SOL-USD", H, Candle(3 * H, 84, 86, 83, 85, 1))  # high reaches limit: max(85.5, 84)
+    assert px.get_order(sid).status == "filled"
+    f = px.fills(3 * H)[0]
+    assert (f.price, f.reason) == (85.5, "stop")
+    assert f.fee == pytest.approx(0.1 * 85.5 * 0.012)
+
+
+def test_gapped_bracket_target_never_fills(px):
+    hold_tenth(px)
+    bid = px.place_bracket("SOL-USD", 0.1, 90.0, 85.5, 120.0, "b1")
+    px.feed("SOL-USD", H, Candle(H, 80, 82, 78, 81, 1))  # gap: stop triggered, unfilled
+    px.feed("SOL-USD", H, Candle(2 * H, 125, 130, 124, 128, 1))  # target is gone; rests at 85.5
+    f = px.fills(2 * H)[0]
+    assert px.get_order(bid).status == "filled" and (f.price, f.reason) == (125.0, "stop")
+
+
 def test_gapped_stop_fills_on_later_candle(px):
     hold_tenth(px)
     sid = px.place_stop("SOL-USD", 0.1, 90.0, 85.5, "s1")
     px.feed("SOL-USD", H, Candle(H, 80, 82, 78, 81, 1))
-    px.feed("SOL-USD", H, Candle(2 * H, 87, 88, 86, 87, 1))  # min(90, 87) = 87 >= 85.5
+    px.feed("SOL-USD", H, Candle(2 * H, 87, 88, 86, 87, 1))  # max(85.5, 87) = 87
     assert px.get_order(sid).status == "filled"
     f = px.fills(2 * H)[0]
     assert (f.price, f.reason, f.ts) == (87.0, "stop", 2 * H)
