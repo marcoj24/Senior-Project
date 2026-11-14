@@ -148,6 +148,18 @@ long trades needing roughly 39% winners to break even. (A floor of 1.8 was
 first written here; it is unreachable with a 2R target at these fees and was
 corrected to 1.5.) The gate loosens by itself as the fee tier improves.
 
+**Owner's actual fees (reported 2026-11-14):** spot 0.50% maker / 0.90%
+taker; futures 0.095% maker / 0.10% taker. On spot that makes the losing cost
+1.6%, so the minimum stop is 8% (a 2R target then gives 1.55 after costs) and
+break-even is about 39% winners. On futures the losing cost is about 0.4%, a
+quarter of spot, so the 5% minimum stop passes easily and break-even drops to
+about 35% winners. Futures are therefore the cheaper venue even with no
+leverage at all. What keeps them in phase 2 is contract size: one contract
+must fit inside the position and leverage limits, which a $25 account almost
+certainly cannot do. The phase 2 gate should be set by the smallest contract's
+notional value against equity, checked from live product specs, rather than by
+the fixed $500 figure alone.
+
 **Targets and exits (builder's call):** the first target is 2 × the stop
 distance (2R); the cost gate is measured against it. At the first target half
 the position is sold with a limit order and the stop on the rest moves to
