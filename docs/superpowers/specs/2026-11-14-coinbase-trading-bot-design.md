@@ -463,3 +463,5 @@ supports them.
 - Stop orders can fill worse than their price in a fast market or gap.
 - Backtests overstate real results.
 - Each sale is likely a taxable event in most jurisdictions.
+
+**Owner jurisdiction (2026-11-14):** United States. Phase 2 therefore targets Coinbase's US-regulated futures venue, not international perpetuals; contract sizes, margin and trading hours must be read from live product specs when phase 2 is planned.
