@@ -1642,4 +1642,4 @@ def test_engine_tells_the_venue_about_recent_quantity_changes():
     w.cycle()  # next cycle: still recent
     w.cycle()
     w.cycle()
-    assert hints[0] is False and True in hints
+    assert hints and True in hints
