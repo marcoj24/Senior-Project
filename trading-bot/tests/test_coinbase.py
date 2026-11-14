@@ -388,6 +388,26 @@ def test_place_bracket_unsupported_and_sends_nothing():
     assert c.named("trigger_bracket_order_gtc_sell") == []
 
 
+def test_preview_stop_sends_what_place_stop_sends_and_places_nothing():
+    from coinbase.rest.types.orders_types import PreviewOrderResponse
+    c = placing_client(preview_stop_limit_order_gtc_sell=PreviewOrderResponse({"order_total": "1"}))
+    ex = make(c)
+    ex.preview_stop("BTC-USD", 0.25, 80.019, 76.0188)
+    ex.place_stop("BTC-USD", 0.25, 80.019, 76.0188, "cid")
+    [prev] = c.named("preview_stop_limit_order_gtc_sell")
+    [real] = c.named("stop_limit_order_gtc_sell")
+    assert prev == {k: v for k, v in real.items() if k != "client_order_id"}
+    assert c.named("limit_order_gtc_buy") == []
+
+
+def test_preview_stop_rejection_raises_with_the_venue_message():
+    from coinbase.rest.types.orders_types import PreviewOrderResponse
+    c = placing_client(preview_stop_limit_order_gtc_sell=PreviewOrderResponse(
+        {"errs": [{"preview_failure_reason": "INVALID_STOP_DIRECTION"}]}))
+    with pytest.raises(ExchangeError, match="INVALID_STOP_DIRECTION"):
+        make(c).preview_stop("BTC-USD", 0.25, 80.0, 76.0)
+
+
 def test_place_ioc_sell_payload():
     c = placing_client()
     assert make(c).place_ioc_sell("BTC-USD", 0.25, 98.0099, "BTC-USD-ioc-1-3") == "i-1"

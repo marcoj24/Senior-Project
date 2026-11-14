@@ -311,6 +311,11 @@ class CoinbaseExchange:
             raise ExchangeError("cannot verify key permissions")
         return any(flags)
 
+    def key_permissions(self) -> dict[str, bool]:
+        """The flags the venue reports for the key (can_view, can_trade, can_transfer), as given."""
+        r = self._private("get_api_key_permissions")
+        return {k: r[k] for k in ("can_view", "can_trade", "can_transfer") if isinstance(r.get(k), bool)}
+
     # --- orders -------------------------------------------------------------------------------
 
     def _size(self, p: Product, base_size: float) -> str:
@@ -361,6 +366,20 @@ class CoinbaseExchange:
         return self._create("stop_limit_order_gtc_sell", client_order_id, product_id,
                             base_size=self._size(p, base_size), limit_price=self._price(p, stop_limit),
                             stop_price=self._price(p, stop_trigger), stop_direction=STOP_DOWN)
+
+    def preview_stop(self, product_id: str, base_size: float, stop_trigger: float, stop_limit: float) -> None:
+        """Asks the venue to check the exact stop-limit sell place_stop would send, without placing it.
+        Raises ExchangeError with the venue's message if it is rejected."""
+        if stop_limit > stop_trigger:
+            raise ExchangeError("stop needs stop_limit <= stop_trigger")
+        p = self._product(product_id)
+        r = self._private("preview_stop_limit_order_gtc_sell", product_id=product_id,
+                          base_size=self._size(p, base_size), limit_price=self._price(p, stop_limit),
+                          stop_price=self._price(p, stop_trigger), stop_direction=STOP_DOWN,
+                          retail_portfolio_id=self._portfolio)
+        errs = r.get("errs")
+        if errs:
+            raise ExchangeError(self._scrub(f"stop preview {product_id} rejected: {errs}"))
 
     def place_ioc_sell(self, product_id: str, base_size: float, limit_price: float, client_order_id: str) -> str:
         p = self._product(product_id)
