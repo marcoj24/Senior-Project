@@ -134,6 +134,14 @@ class Engine:
             del self.episodes[key]
             self._set_meta("episodes", self.episodes)
 
+    def _clear_episodes(self, pid: str) -> None:
+        """A deleted position ends every alert episode of its product."""
+        keys = [k for k in self.episodes if k.split("|")[-1] == pid]
+        for k in keys:
+            del self.episodes[k]
+        if keys:
+            self._set_meta("episodes", self.episodes)
+
     def _dust(self, pos: Position, why: str) -> None:
         """A position too small to carry a sell order: alert and journal once per size."""
         if self._episode(f"dust|{pos.product_id}", pos.base_size):
@@ -198,6 +206,8 @@ class Engine:
             if not self.pos:
                 return False
             open_ids = {o.order_id for o in self.ex.open_orders()}
+            if any(r["kind"] != "entry" and oid not in open_ids for oid, r in self.orders.items()):
+                return True  # a finished exit order still to be accounted
             return any(self._uncovered(pos, open_ids) for pos in self.pos.values())
         except Exception as e:  # cannot tell: keep watching
             self._log("error", None, where="needs_watch", error=repr(e))
@@ -244,17 +254,21 @@ class Engine:
     def _guard(self, res: CycleResult | None, pid: str | None, where: str, fn, alert: str | None = None) -> bool:
         """Run one unit of work. An ExchangeError, or any unexpected error, is journaled, recorded
         and (unexpected ones always) alerted; it never escapes, so the next unit still runs."""
-        key = f"engine|{where}|{pid}"
+        key, xkey = f"engine|{where}|{pid}", f"exchange|{where}|{pid}"
         try:
             fn()
-            if key in getattr(self, "episodes", {}):
-                self._end_episode(key)
+            for k in (key, xkey):
+                if k in getattr(self, "episodes", {}):
+                    self._end_episode(k)
             return True
         except ExchangeError as e:
-            self._log("error", pid, where=where, error=str(e))
-            if alert:
-                self._alert(alert, f"{pid or where}: {e}")
             msg = str(e)
+            try:
+                self._log("error", pid, where=where, error=msg)
+                if alert and (not hasattr(self, "episodes") or self._episode(xkey)):
+                    self._alert(alert, f"{pid or where}: {e}")
+            except Exception:
+                pass  # the store itself is failing; nothing more can be recorded
         except Exception as e:
             msg = repr(e)
             try:
@@ -383,6 +397,7 @@ class Engine:
         failing -> the intent stays pending and is resolved by the next sync or fill poll.
         Returns (order_id, recovered)."""
         self._check_no_pending(pid)
+        self._check_sell_room(pid, size)
         cid = self._cid(pid, kind)
         self.pending[cid] = {"kind": kind, "product_id": pid, "size": size, **extra}
         self._save_pending()
@@ -402,6 +417,25 @@ class Engine:
         self.pending.pop(cid, None)
         self._save_pending()
         return oid, False
+
+    def _check_sell_room(self, pid: str, size: float) -> None:
+        """No sell may exceed the bot's own position net of its other open sells, and none is placed
+        while any of its sells has fills the bot has not accounted yet (the balance is never used)."""
+        pos = self.pos.get(pid)
+        if pos is None:
+            raise ExchangeError(f"{pid}: no position to sell")
+        committed = 0.0
+        for oid, r in list(self.orders.items()):
+            if r["product_id"] != pid or r["kind"] == "entry":
+                continue
+            o = self.ex.get_order(oid)
+            if o.filled_size > r["acc_size"] + _EPS:
+                raise ExchangeError(f"{pid}: fills of {oid} are not accounted yet")
+            if o.status == "open":
+                committed += o.base_size - o.filled_size
+        if committed + size > pos.base_size + _EPS:
+            raise ExchangeError(f"{pid}: sell {size} with {committed} resting would exceed the position "
+                                f"{pos.base_size}")
 
     def _check_no_pending(self, pid: str) -> None:
         if any(r["product_id"] == pid for r in self.pending.values()):
@@ -507,6 +541,8 @@ class Engine:
         self.store.delete_position(pid)
         del self.pos[pid]
         self._save_trades()
+        self._end_forced_exit(pid, f"position closed ({reason})")
+        self._clear_episodes(pid)
         self._log("trade_closed", pid, pnl_usd=pnl, r_multiple=pnl / risk if risk > 0 else None,
                   exit_reason=reason, entry_price=pos.entry_price, opened_ts=pos.opened_ts, **t)
         if self.state is not None:
@@ -546,6 +582,7 @@ class Engine:
             del self.pos[pid]
             self.trades.pop(pid, None)
             self._save_trades()
+            self._clear_episodes(pid)
             self._alert("position reconciled", f"{pid}: coins sold outside the bot; position removed")
 
     # ---------------------------------------------------------------- 3. protect
@@ -589,18 +626,39 @@ class Engine:
         if self._is_dust(pos):
             self._dust(pos, "too small to sell")
             return
+        p = self._product(pid)
+        if p.status != "online":  # the IOC would be rejected: keep the resting stops
+            if self._episode(f"blocked|{pid}", p.status):
+                self._log("forced_exit_blocked", pid, status=p.status, bid=bid, stop=pos.stop_price)
+                self._alert("forced exit blocked", f"{pid} is {p.status}: bid {bid} below stop "
+                                                   f"{pos.stop_price}; stops left in place")
+            return
+        key = f"forced|{pid}"
+        ep = self.episodes.get(key)
+        if ep and self.now() < ep["next_ts"]:
+            return  # backing off after an IOC that died unfilled
         self._cancel_legs(pos)
         if pid not in self.pos:
             return
-        p = self._product(pid)
         size = round_down(min(pos.base_size, _held(self.ex.balances(), p)), p.base_increment)
         if size < p.min_base_size:
             self._dust(pos, "too small to sell")
             return
         limit = round_down(bid * FORCED_EXIT_PRICE, p.quote_increment)
         oid, _ = self._place_order("ioc", pid, size, lambda cid: self.ex.place_ioc_sell(pid, size, limit, cid))
-        self._log("forced_exit", pid, order_id=oid, size=size, limit=limit, bid=bid, stop=pos.stop_price)
-        self._alert("forced exit", f"{pid}: bid {bid} below stop {pos.stop_price}; IOC sell {size} at {limit}")
+        attempts = (ep or {}).get("attempts", 0) + 1
+        wait = min(self.cfg.fill_poll_seconds * 2 ** (attempts - 1), self.cfg.cycle_minutes * 60)
+        self.episodes[key] = {"attempts": attempts, "next_ts": self.now() + wait}
+        self._set_meta("episodes", self.episodes)
+        self._log("forced_exit", pid, order_id=oid, size=size, limit=limit, bid=bid, stop=pos.stop_price,
+                  attempt=attempts)
+        if ep is None:
+            self._alert("forced exit", f"{pid}: bid {bid} below stop {pos.stop_price}; IOC sell {size} at {limit}")
+
+    def _end_forced_exit(self, pid: str, how: str) -> None:
+        if f"forced|{pid}" in self.episodes:
+            self._end_episode(f"forced|{pid}")
+            self._alert("forced exit ended", f"{pid}: {how}")
 
     def _protect_grown(self, res: CycleResult | None) -> None:
         for pid in sorted(self._grown):
@@ -627,6 +685,12 @@ class Engine:
         if not self._guard(None, None, "watch open orders",
                            lambda: open_ids.update(o.order_id for o in self.ex.open_orders())):
             return
+        if any(r["kind"] != "entry" and oid not in open_ids for oid, r in self.orders.items()):
+            # finished exit orders: account them first; an exit IOC with fills not yet visible
+            # stays in the registry, so it keeps counting as in flight and is never sold twice
+            if not self._guard(None, None, "watch sync", lambda: self._sync_orders(None)):
+                return
+            open_ids = {o.order_id for o in self.ex.open_orders()}
         for pid in list(self.pos):
             pos = self.pos.get(pid)
             ok = True
@@ -708,9 +772,15 @@ class Engine:
             self.store.save_position(pos)
         o = self.ex.get_order(oid)
         if o.status == "cancelled" or abs(o.base_size - size) > _EPS:
+            if o.status == "open":  # wrong size but live: it must not keep holding coins untracked
+                self.ex.cancel(oid)
+                if self.ex.get_order(oid).status == "open":
+                    raise ExchangeError(f"{kind} leg {oid} has the wrong size and did not cancel")
             pos.legs = [lg for lg in pos.legs if lg.order_id != oid]  # never count a dead leg
             self.store.save_position(pos)
             raise ExchangeError(f"{kind} leg {oid} is not live")
+        self._end_forced_exit(pid, "stops restored")  # a live protective leg ends a forced-exit episode
+        self._end_episode(f"blocked|{pid}")
 
     def _register(self, oid: str, kind: str, pid: str, cid: str, size: float, **extra):
         if oid in self.orders:  # already tracked: never reset its accounted fills
@@ -821,9 +891,10 @@ class Engine:
             self._protect(pos)  # the gap alone is below the minimum: re-place merged legs
 
     def _ioc_in_flight(self, pid: str, open_ids: set[str] | None = None) -> bool:
-        """An exit IOC for the product is tracked (and, given the venue's open ids, still open)."""
-        return any(r["kind"] == "ioc" and r["product_id"] == pid and (open_ids is None or oid in open_ids)
-                   for oid, r in self.orders.items())
+        """An exit IOC for the product is still in the registry. Call after a sync: the sync drops
+        an IOC only once it is finished and all its fills are accounted, so a filled IOC whose fills
+        are not visible yet still counts (`open_ids` is accepted for call-site symmetry only)."""
+        return any(r["kind"] == "ioc" and r["product_id"] == pid for r in self.orders.values())
 
     def _replace_stop(self, pos: Position, new_stop: float, why: str) -> None:
         """Verified cancel-and-replace of the stop legs at a higher stop. Stops never move down."""

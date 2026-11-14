@@ -462,9 +462,11 @@ def test_cancel_only_product_exits_still_work():
     w.cycle()  # protection is still attempted
     assert w.sells() == pytest.approx(pos.base_size)
     w.bar(90.0, low=88.0, high=92.0, open_=90.0)
-    w.cycle()  # and so is the forced exit
-    assert "forced exit" in w.titles()
-    assert [o.kind for o in w.ex.open_orders()] == ["ioc"]
+    w.cycle()  # a forced exit would be rejected: the resting stops are kept and the owner alerted
+    w.cycle()
+    assert w.titles().count("forced exit blocked") == 1
+    assert sorted(o.kind for o in w.ex.open_orders()) == ["bracket", "stop"]
+    assert not any(o.kind == "ioc" for o in w.ex._orders.values())
 
 
 def test_risk_off_scans_nothing():
@@ -947,3 +949,116 @@ def test_stop_moved_only_when_the_new_stop_is_live():
     rows = w.store.journal_rows("stop_moved")
     assert len(rows) == moved + 1 and calls[0] == 2
     assert w.sells() == pytest.approx(w.position().base_size)
+
+
+def test_filled_ioc_with_lagging_fills_is_not_sold_twice():
+    w = World()
+    pos = w.enter()
+    gap_below_stop(w)
+    w.cycle()
+    [ioc] = [o for o in w.ex.open_orders() if o.kind == "ioc"]
+    w.ex._coins["SOL"] += 10.0  # the owner's own SOL, not the bot's
+    real_fills, hide = w.ex.fills, [True]
+    w.ex.fills = lambda since: [f for f in real_fills(since) if not (hide[0] and f.order_id == ioc.order_id)]
+    w.bar(89.0, low=87.0, high=91.0, open_=90.0)  # the IOC fills; its fills are not visible yet
+    assert w.ex.get_order(ioc.order_id).filled_size == pytest.approx(pos.base_size)
+    for _ in range(3):
+        w.engine.watch_fills()
+        w.engine.run_cycle()
+    assert len([o for o in w.ex._orders.values() if o.kind == "ioc"]) == 1  # no second IOC
+    assert not [o for o in w.ex.open_orders() if o.kind != "entry"]
+    hide[0] = False
+    r = w.engine.run_cycle()
+    assert r.exited == ["SOL-USD"] and w.position() is None
+    assert len(w.store.journal_rows("trade_closed")) == 1
+    w.engine.run_cycle()
+    w.engine.watch_fills()
+    assert len(w.store.journal_rows("trade_closed")) == 1
+    assert w.ex.balances()["SOL"] == pytest.approx(10.0)  # the owner's coins untouched
+
+
+def test_no_sell_exceeds_position_net_of_unaccounted_fills():
+    w = World()
+    pos = w.enter()
+    w.ex._coins["SOL"] += 10.0
+    stop_leg = next(leg for leg in pos.legs if leg.kind == "stop")
+    real_fills = w.ex.fills
+    w.ex.fills = lambda since: [f for f in real_fills(since) if f.order_id != stop_leg.order_id]
+    o = w.ex._orders[stop_leg.order_id]
+    w.ex._fill(o, o.remaining, STOP, T0 + H4, "stop")  # the venue fills the stop; the bot cannot see it
+    w.ex.cancel(next(leg.order_id for leg in pos.legs if leg.kind == "bracket"))  # and a leg goes missing
+    w.engine.watch_fills()
+    w.engine.run_cycle()
+    sells = [x for x in w.ex._orders.values() if x.kind != "entry" and x.order_id not in
+             {leg.order_id for leg in pos.legs}]
+    assert sells == []  # nothing new is placed while a fill is unaccounted
+
+
+def test_forced_exit_retries_back_off_and_alert_once():
+    w = World()
+    w.enter()
+    real = w.ex.place_ioc_sell
+
+    def dead_on_arrival(*args):
+        oid = real(*args)
+        w.ex._orders[oid].status = "cancelled"  # accepted, then dies unfilled at once
+        return oid
+
+    w.ex.place_ioc_sell = dead_on_arrival
+    gap_below_stop(w)
+    t0 = w.clock.t
+    w.engine.run_cycle()  # attempt 1
+    for i in range(1, 13):  # 60 seconds of 5 s polls
+        w.clock.t = t0 + 5 * i
+        w.engine.watch_fills()
+    iocs = [o for o in w.ex._orders.values() if o.kind == "ioc"]
+    assert len(iocs) == 4  # at 0, 5, 15, 35 s
+    assert len(w.store.journal_rows("forced_exit")) == 4
+    assert w.titles().count("forced exit") == 1
+    w.ex.place_ioc_sell = real
+    w.bar(110.0, low=108.0, high=112.0, open_=110.0)  # recovers above the stop
+    w.watch()  # stops restored: the episode ends with one follow-up alert
+    assert "forced exit ended" in w.titles()
+    assert w.titles().count("forced exit") == 1
+
+
+def test_mismatched_leg_is_cancelled_before_it_is_dropped():
+    w = World()
+    w.cycle()
+    w.bar(121.0)
+    real, calls = w.ex.place_stop, []
+
+    def short_once(pid, size, trig, lim, cid):
+        calls.append(cid)
+        return real(pid, round(size - 0.001, 3) if len(calls) == 1 else size, trig, lim, cid)
+
+    w.ex.place_stop = short_once
+    w.watch()
+    bad = w.ex._orders[w.ex._by_client_id[calls[0]]]
+    assert bad.status == "cancelled"
+    assert w.sells() == pytest.approx(w.position().base_size)
+
+
+def test_episodes_cleared_when_a_position_is_deleted():
+    w = World()
+    w.cycle()
+    [order] = w.entries()
+    w.ex.partial_fill(order.order_id, 0.005, ENTRY, T0)
+    w.engine.watch_fills()
+    assert any(k.endswith("|SOL-USD") for k in json.loads(w.store.get_meta("episodes")))
+    w.ex.cancel(order.order_id)
+    w.ex._coins["SOL"] = 0.0  # the owner sold the dust
+    w.engine.run_cycle()
+    assert w.position() is None
+    assert not any(k.endswith("|SOL-USD") for k in json.loads(w.store.get_meta("episodes")))
+
+
+def test_exchange_error_alerts_once_per_episode():
+    w = two_positions()
+    del w.ex._products["AVAX-USD"]
+    w.engine.run_cycle()
+    first = w.titles().count("protection failed")
+    assert 1 <= first <= 2  # once per failing unit (protect, trail) for AVAX
+    for _ in range(3):
+        w.engine.run_cycle()
+    assert w.titles().count("protection failed") == first
