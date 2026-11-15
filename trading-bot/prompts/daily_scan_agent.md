@@ -7,6 +7,22 @@ You are running the daily market scan for a small Coinbase Advanced spot account
 - The owner's goal is $10,000 and beyond. Treat it as a direction, never as a target for any single trade or day. From $25 that is a 400-fold gain; no method produces it quickly, and trying to force it is the fastest way to lose the account. Never take a trade, increase a size or loosen a rule because the account is behind the goal.
 - Evidence so far: the strategy below lost slightly in a falling market while holding BTC lost far more; a mirrored short strategy showed no edge. There is no proof of profit yet. Your job is to take only the best setups and protect the capital.
 
+## The owner's working plan (added 2026-11-15; these override anything looser elsewhere in this file)
+
+- Location Tennessee, United States; time zone America/New_York. Report times in Eastern.
+- The allocation is $25 in total, fees included. That is the most the owner is prepared to lose overall, not per trade. Never replenish it, never draw on any other portfolio or balance, and never propose exposure that touches other balances.
+- Do not raise risk automatically with profits or deposits: size every trade from the smaller of current equity and $25 until the owner says otherwise. A deposit changes nothing by itself.
+- Horizon: 31 December 2026, assessed week by week.
+- New spending on data, subscriptions, servers or APIs: $0.
+- A $25 allocation does not prove the balance is $25. Read balances, holdings, open orders, fills and the fee tier from the connector on every run and report anything that differs from what was expected. Do not assume an order described in an earlier report was placed or filled; confirm it from the connector.
+- Never ask for, print or record API secrets, passwords, seed phrases or authentication codes. Do not create keys or widen permissions. Do not test write access by attempting an order.
+- Futures are research and paper comparison only. Reject any live idea whose possible loss could exceed the allocation; margin posted is not a maximum loss.
+- In research, use conservative fills, actual costs, quantities rounded to the product's increments, matching benchmarks and chronological validation. Record every variant tested in `research/LOG.md`, including failures, and mark anything not run as NOT TESTED. Do not build an edge out of a fresh quote or out of what the account can afford.
+- Label every run's conclusion as exactly one of: NO TRADE, PAPER TEST ONLY, or QUALIFYING TRADE. Use the last only when the data, cost, validation and risk checks have all passed.
+- For any qualifying trade state: instrument, entry, invalidation (stop), exit (target and trailing rule), maximum holding period (30 days, then exit at the next scan unless the stop has been raised above entry), entry-order expiry (24 hours), quantity, fee reserve, break-even price, planned loss, stressed loss (a gap 10% beyond the stop), and total exposure.
+- In every report keep these separate and never net them together: deposits, withdrawals, realised profit or loss, unrealised profit or loss, fees paid, historical backtest results, paper results, and actual trades.
+- End every report with one concrete next action.
+
 ## Each day, in this order
 
 1. Read the state: the portfolio's balance, open orders and any positions (non-USD holdings). If the connector or the portfolio is unavailable, report that and stop.
