@@ -28,3 +28,18 @@
 - Daily trend following on BTC/ETH with regime switch: NOT TESTED.
 - Weekly cross-sectional momentum: NOT TESTED.
 - Regular fixed-amount BTC buying baseline: NOT TESTED.
+
+## 2026-11-16 (Sunday evening Eastern run) — weekly review 1: daily trend following on BTC and ETH with a regime switch
+
+- Hypothesis: holding BTC/ETH only while each is above its long-term trend avoids most large drawdowns and, after costs, beats holding BTC and regular fixed-amount BTC buying. Disproved if it beats neither baseline in the later part of the data.
+- Method: `research/trend_btc_eth.py`. Daily bars from the downloaded history (about 13 Apr 2024 to 15 Nov 2026), 745 evaluated days after a 200-day warm-up. Signal on the daily close, trade at the next day's open. Cost 1.00% per side (taker 0.90% + 0.10% slippage), applied to every entry and exit and to the baselines. $12.50 sleeve each in BTC and ETH. No parameters tuned; three pre-stated rules, all reported. Split: first 60% of the evaluated days, then the last 40% ("held-out", but a single market cycle).
+- Results (total return / max drawdown / first 60% / last 40%):
+  - A close > 200-day average: −7.4% / 35.2% / −1.3% / −6.2% (11 BTC and 11 ETH entries)
+  - B close > 200-day and 50-day > 200-day (the bot's regime rule): −19.2% / 36.1% / −8.4% / −11.8% (10 and 7 entries)
+  - C close > 100-day average: −20.8% / 51.3% / +5.7% / −25.1% (17 and 22 entries)
+  - Hold BTC: −5.7% / 53.1% / +28.0% / −26.3%
+  - Hold 50% BTC / 50% ETH: −16.6% / 60.0% / +23.9% / −32.7%
+  - Weekly fixed-amount BTC buying: −21.4% / 36.5% / −3.9% / −18.1%
+- Verdict: PAPER TEST ONLY at most; nothing here supports adopting a change. Rule A cut the drawdown (35% against 53% for holding BTC) and lost less in the falling last 40%, but it earned nothing over the whole period (−7.4%, slightly worse than holding BTC's −5.7%) and missed the first-60% rise (−1.3% against +28.0%). It made 22 entries in total, one bull-and-bear cycle: too few trades to claim an edge. The bot's own regime rule (B) did worse than A in this sample, which is a prompt to examine it, not a finding.
+- Sources of optimism/pessimism: fills at the next open with no gap risk; 1% per side is conservative against maker entries (0.5% + slippage); no funding or tax effects; BTC and ETH only; one cycle.
+- NOT TESTED: maker-entry cost variant, other average lengths (deliberately not tuned), weekly momentum among liquid coins (next week's hypothesis), futures-based versions, any live or paper trading.
