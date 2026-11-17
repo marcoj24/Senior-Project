@@ -43,3 +43,9 @@
 - Verdict: PAPER TEST ONLY at most; nothing here supports adopting a change. Rule A cut the drawdown (35% against 53% for holding BTC) and lost less in the falling last 40%, but it earned nothing over the whole period (−7.4%, slightly worse than holding BTC's −5.7%) and missed the first-60% rise (−1.3% against +28.0%). It made 22 entries in total, one bull-and-bear cycle: too few trades to claim an edge. The bot's own regime rule (B) did worse than A in this sample, which is a prompt to examine it, not a finding.
 - Sources of optimism/pessimism: fills at the next open with no gap risk; 1% per side is conservative against maker entries (0.5% + slippage); no funding or tax effects; BTC and ETH only; one cycle.
 - NOT TESTED: maker-entry cost variant, other average lengths (deliberately not tuned), weekly momentum among liquid coins (next week's hypothesis), futures-based versions, any live or paper trading.
+
+## 2026-11-17 08:17 UTC — setup blocked by the regime rule (tracked, not traded)
+
+- First setup seen since the scans began: VVV-USD, bid 21.4135; retest entry 20.2352, stop 18.524 (8.5% below), target 23.6576 (2R). Net reward-to-risk after costs 1.57 (gate 1.5), size 0.368 VVV ($7.45) risking $0.75. Relative strength +0.091 against BTC.
+- Decision: NO TRADE. The market regime is risk-off (0 of 21 liquid coins above their 50-day average), and the rules do not buy in risk-off. Nothing was placed.
+- Why record it: it is the first data point on what the regime rule costs. Check later whether the entry filled and whether price reached the target or the stop first; if risk-off blocks many setups that would have worked, that is evidence to revisit the rule with the owner. Outcome: NOT YET CHECKED.
